@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Product, Category, Cart, CartItem,
-    UserProfile, Address, Order, OrderItem,
+    UserProfile, Address, Order, OrderStatusUpdate, OrderItem,
     Wishlist, Review, Coupon
 )
 from django.contrib.auth.models import User
@@ -109,8 +109,15 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = ['id', 'product', 'product_name', 'product_image', 'quantity', 'price', 'subtotal']
 
 
+class OrderStatusUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderStatusUpdate
+        fields = ['status', 'note', 'created_at']
+
+
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
+    status_history = OrderStatusUpdateSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -119,7 +126,7 @@ class OrderSerializer(serializers.ModelSerializer):
             'shipping_name', 'shipping_phone', 'shipping_address',
             'shipping_city', 'shipping_state', 'shipping_postal_code',
             'subtotal', 'discount_amount', 'shipping_charge', 'total_amount',
-            'coupon_code', 'items', 'created_at', 'updated_at',
+            'coupon_code', 'items', 'status_history', 'created_at', 'updated_at',
         ]
 
 

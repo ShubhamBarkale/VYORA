@@ -29,6 +29,7 @@ export default function OrderDetailPage() {
   );
 
   const stepIdx = STEP_MAP[order.status] ?? -1;
+  const timeline = Array.isArray(order.status_history) ? order.status_history : [];
 
   return (
     <div style={{ background:'var(--vyora-bg)' }} className="pb-24 md:pb-8 page-transition">
@@ -71,6 +72,29 @@ export default function OrderDetailPage() {
                   {i < STEPS.length - 1 && (
                     <div className={`flex-1 h-0.5 mt-5 mx-1 rounded-full transition-all duration-500 ${i < stepIdx ? 'bg-indigo-600' : 'bg-gray-200 dark:bg-slate-700'}`} />
                   )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {timeline.length > 0 && (
+          <div className="vyora-card p-5 mb-5" style={{ '--shadow-hover':'none' }}>
+            <h2 className="text-sm font-bold uppercase tracking-widest mb-4" style={{ color:'var(--vyora-muted)' }}>Tracking Timeline</h2>
+            <div className="space-y-4">
+              {timeline.map((event, index) => (
+                <div key={`${event.status}-${event.created_at}-${index}`} className="flex gap-3">
+                  <div className="flex flex-col items-center">
+                    <div className="h-3 w-3 rounded-full bg-indigo-600" />
+                    {index < timeline.length - 1 && <div className="mt-1 h-full w-px bg-slate-200 dark:bg-slate-700" />}
+                  </div>
+                  <div className="flex-1 pb-2">
+                    <p className="text-sm font-semibold capitalize" style={{ color:'var(--vyora-text)' }}>{event.status}</p>
+                    <p className="text-xs mt-1" style={{ color:'var(--vyora-muted)' }}>{event.note || 'Status updated'}</p>
+                    <p className="text-[11px] mt-1" style={{ color:'var(--vyora-muted)' }}>
+                      {new Date(event.created_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}
+                    </p>
+                  </div>
                 </div>
               ))}
             </div>

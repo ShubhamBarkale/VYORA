@@ -152,6 +152,44 @@ class Order(models.Model):
         else:
             super().save(*args, **kwargs)
 
+    def record_status_update(self, status, note='', save=True):
+        if status not in dict(self.STATUS_CHOICES):
+            raise ValueError(f'Invalid order status: {status}')
+
+        self.status = status
+        if save:
+            self.save(update_fields=['status', 'updated_at'])
+
+        OrderStatusUpdate.objects.create(
+            order=self,
+            status=status,
+            note=note or self._status_note(status),
+        )
+
+    def _status_note(self, status):
+        notes = {
+            'pending': 'Order placed and awaiting payment confirmation.',
+            'confirmed': 'Order confirmed and being prepared.',
+            'processing': 'Order is being processed.',
+            'shipped': 'Order has been shipped.',
+            'delivered': 'Order delivered successfully.',
+            'cancelled': 'Order was cancelled.',
+        }
+        return notes.get(status, 'Order status updated.')
+
+
+class OrderStatusUpdate(models.Model):
+    order = models.ForeignKey(Order, related_name='status_history', on_delete=models.CASCADE)
+    status = models.CharField(max_length=20, choices=Order.STATUS_CHOICES)
+    note = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.order.order_number} - {self.status}"
+
 
 class OrderItem(models.Model):
     order = models.ForeignKey(Order, related_name='items', on_delete=models.CASCADE)

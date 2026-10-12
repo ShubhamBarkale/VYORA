@@ -4,6 +4,7 @@ import Navbar           from './components/Navbar.jsx';
 import Footer           from './components/Footer.jsx';
 import BottomNav        from './components/BottomNav.jsx';
 import PrivateRouter    from './components/PrivateRouter.jsx';
+import AIShoppingAssistant from './components/AIShoppingAssistant.jsx';
 import { useAuth }      from './context/AuthContext.jsx';
 
 import HomePage           from './pages/HomePage.jsx';
@@ -65,6 +66,7 @@ function AppRoutes() {
         </Routes>
       </main>
       <Footer />
+      <AIShoppingAssistant />
       <BottomNav />
     </>
   );

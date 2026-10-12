@@ -1,10 +1,13 @@
 import hmac
 import hashlib
+import re
+
 import razorpay
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.db import transaction
 from django.db.models import Q
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
@@ -16,13 +19,13 @@ from rest_framework import status
 
 from .models import (
     Product, Category, Cart, CartItem,
-    UserProfile, Address, Order, OrderItem,
+    UserProfile, Address, Order, OrderStatusUpdate, OrderItem,
     Wishlist, Review, Coupon
 )
 from .serializers import (
     ProductSerializer, CategorySerializer,
     CartSerializer, CartItemSerializer,
-    OrderSerializer, OrderItemSerializer,
+    OrderSerializer, OrderItemSerializer, OrderStatusUpdateSerializer,
     UserSerializer, RegisterSerializer,
     UpdateProfileSerializer, ChangePasswordSerializer,
     AddressSerializer, WishlistSerializer,
@@ -341,63 +344,73 @@ def _send_order_confirmation(order):
         pass
 
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def create_order(request):
-    data = request.data
-
-    # Validate shipping info
-    required = ['shipping_name', 'shipping_phone', 'shipping_address',
-                 'shipping_city', 'shipping_state', 'shipping_postal_code']
+def _validate_shipping_data(data):
+    required = ['shipping_name', 'shipping_phone', 'shipping_address', 'shipping_city', 'shipping_state', 'shipping_postal_code']
     for field in required:
         if not data.get(field, '').strip():
-            return Response({'error': f'{field} is required'}, status=400)
+            return {'error': f'{field} is required'}, 400
 
     phone = data.get('shipping_phone', '')
     if not phone.isdigit() or len(phone) < 10:
-        return Response({'error': 'Invalid phone number (must be 10+ digits)'}, status=400)
+        return {'error': 'Invalid phone number (must be 10+ digits)'}, 400
 
     payment_method = data.get('payment_method', 'COD')
     if payment_method not in ['COD', 'RAZORPAY']:
-        return Response({'error': 'Invalid payment method'}, status=400)
+        return {'error': 'Invalid payment method'}, 400
+    return None, None
 
-    # Get cart
-    cart, _ = Cart.objects.get_or_create(user=request.user)
-    cart_items = cart.items.select_related('product').all()
-    if not cart_items.exists():
-        return Response({'error': 'Your cart is empty'}, status=400)
 
-    # Validate stock for all items
-    for item in cart_items:
-        if item.quantity > item.product.stock:
-            return Response({
-                'error': f'Only {item.product.stock} units of "{item.product.name}" available'
-            }, status=400)
-
-    # Calculate totals
+def _calculate_order_totals(cart_items, coupon_code):
     subtotal = sum(item.product.discounted_price * item.quantity for item in cart_items)
     shipping_charge = 0 if subtotal >= 500 else 49
     discount_amount = 0
-    coupon_code = data.get('coupon_code', '').strip().upper()
 
     if coupon_code:
         try:
             coupon = Coupon.objects.get(code=coupon_code)
-            if not coupon.is_valid:
-                return Response({'error': 'Coupon is expired or invalid'}, status=400)
-            if subtotal < coupon.min_order_amount:
-                return Response({
-                    'error': f'Minimum order ₹{coupon.min_order_amount} required for this coupon'
-                }, status=400)
-            discount_amount = coupon.calculate_discount(subtotal)
-            coupon.used_count += 1
-            coupon.save()
         except Coupon.DoesNotExist:
-            return Response({'error': 'Invalid coupon code'}, status=400)
+            raise ValueError('Invalid coupon code')
+
+        if not coupon.is_valid:
+            raise ValueError('Coupon is expired or invalid')
+        if subtotal < coupon.min_order_amount:
+            raise ValueError(f'Minimum order ₹{coupon.min_order_amount} required for this coupon')
+
+        discount_amount = coupon.calculate_discount(subtotal)
+        coupon.used_count += 1
+        coupon.save(update_fields=['used_count'])
 
     total_amount = subtotal - discount_amount + shipping_charge
+    return subtotal, shipping_charge, discount_amount, total_amount
 
-    # Create order
+
+@transaction.atomic
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_order(request):
+    data = request.data
+    validation_error = _validate_shipping_data(data)
+    if validation_error[0] is not None:
+        return Response(validation_error[0], status=validation_error[1])
+
+    payment_method = data.get('payment_method', 'COD')
+    cart, _ = Cart.objects.get_or_create(user=request.user)
+    cart_items = list(cart.items.select_related('product').all())
+    if not cart_items:
+        return Response({'error': 'Your cart is empty'}, status=400)
+
+    try:
+        subtotal, shipping_charge, discount_amount, total_amount = _calculate_order_totals(
+            cart_items,
+            data.get('coupon_code', '').strip().upper(),
+        )
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=400)
+
+    for item in cart_items:
+        if item.quantity > item.product.stock:
+            return Response({'error': f'Only {item.product.stock} units of "{item.product.name}" available'}, status=400)
+
     order = Order.objects.create(
         user=request.user,
         shipping_name=data['shipping_name'],
@@ -412,11 +425,10 @@ def create_order(request):
         discount_amount=discount_amount,
         shipping_charge=shipping_charge,
         total_amount=total_amount,
-        coupon_code=coupon_code,
-        status='confirmed' if payment_method == 'COD' else 'pending',
+        coupon_code=data.get('coupon_code', '').strip().upper(),
+        status='pending' if payment_method == 'RAZORPAY' else 'confirmed',
     )
 
-    # Create order items and deduct stock
     for item in cart_items:
         OrderItem.objects.create(
             order=order,
@@ -426,18 +438,27 @@ def create_order(request):
             quantity=item.quantity,
             price=item.product.discounted_price,
         )
-        # Deduct stock
-        item.product.stock -= item.quantity
-        item.product.save(update_fields=['stock'])
 
-    # Clear cart
-    cart_items.delete()
+    if payment_method == 'COD':
+        for item in cart_items:
+            item.product.stock -= item.quantity
+            item.product.save(update_fields=['stock'])
+        order.payment_status = 'paid'
+        order.save(update_fields=['payment_status'])
+        order.record_status_update('confirmed', 'Cash on delivery order confirmed.')
+        cart.items.all().delete()
+        _send_order_confirmation(order)
+        return Response({
+            'message': 'Order placed successfully',
+            'order_number': order.order_number,
+            'order_id': order.id,
+            'total_amount': str(order.total_amount),
+            'payment_method': order.payment_method,
+        }, status=201)
 
-    # Send confirmation email
-    _send_order_confirmation(order)
-
+    order.record_status_update('pending', 'Awaiting Razorpay payment confirmation.')
     return Response({
-        'message': 'Order placed successfully',
+        'message': 'Order created. Please complete payment.',
         'order_number': order.order_number,
         'order_id': order.id,
         'total_amount': str(order.total_amount),
@@ -448,7 +469,7 @@ def create_order(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_my_orders(request):
-    orders = Order.objects.filter(user=request.user).prefetch_related('items')
+    orders = Order.objects.filter(user=request.user).prefetch_related('items', 'status_history')
     serializer = OrderSerializer(orders, many=True)
     return Response(serializer.data)
 
@@ -457,7 +478,7 @@ def get_my_orders(request):
 @permission_classes([IsAuthenticated])
 def get_order_detail(request, order_number):
     try:
-        order = Order.objects.prefetch_related('items').get(
+        order = Order.objects.prefetch_related('items', 'status_history').get(
             order_number=order_number, user=request.user
         )
         serializer = OrderSerializer(order)
@@ -473,17 +494,61 @@ def get_order_detail(request, order_number):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_razorpay_order(request):
-    """Step 1: Create a Razorpay order and return the order_id to the frontend."""
+    """Step 1: Create a pending order and return Razorpay metadata."""
     if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
         return Response({'error': 'Razorpay is not configured. Please add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to your .env'}, status=503)
 
-    # First create our order in pending state
-    order_response = create_order(request._request)  # reuse the create_order logic
-    if order_response.status_code != 201:
-        return order_response
+    data = request.data
+    validation_error = _validate_shipping_data(data)
+    if validation_error[0] is not None:
+        return Response(validation_error[0], status=validation_error[1])
 
-    order_number = order_response.data['order_number']
-    order = Order.objects.get(order_number=order_number)
+    cart, _ = Cart.objects.get_or_create(user=request.user)
+    cart_items = list(cart.items.select_related('product').all())
+    if not cart_items:
+        return Response({'error': 'Your cart is empty'}, status=400)
+
+    try:
+        subtotal, shipping_charge, discount_amount, total_amount = _calculate_order_totals(
+            cart_items,
+            data.get('coupon_code', '').strip().upper(),
+        )
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=400)
+
+    for item in cart_items:
+        if item.quantity > item.product.stock:
+            return Response({'error': f'Only {item.product.stock} units of "{item.product.name}" available'}, status=400)
+
+    order = Order.objects.create(
+        user=request.user,
+        shipping_name=data['shipping_name'],
+        shipping_phone=data['shipping_phone'],
+        shipping_address=data['shipping_address'],
+        shipping_city=data['shipping_city'],
+        shipping_state=data['shipping_state'],
+        shipping_postal_code=data['shipping_postal_code'],
+        payment_method='RAZORPAY',
+        payment_status='pending',
+        subtotal=subtotal,
+        discount_amount=discount_amount,
+        shipping_charge=shipping_charge,
+        total_amount=total_amount,
+        coupon_code=data.get('coupon_code', '').strip().upper(),
+        status='pending',
+    )
+
+    for item in cart_items:
+        OrderItem.objects.create(
+            order=order,
+            product=item.product,
+            product_name=item.product.name,
+            product_image=item.product.image.url if item.product.image else '',
+            quantity=item.quantity,
+            price=item.product.discounted_price,
+        )
+
+    order.record_status_update('pending', 'Awaiting Razorpay payment confirmation.')
     amount_paise = int(float(order.total_amount) * 100)
 
     try:
@@ -504,24 +569,29 @@ def create_razorpay_order(request):
             'key_id': settings.RAZORPAY_KEY_ID,
         })
     except Exception as e:
-        order.delete()  # rollback
+        order.status = 'cancelled'
+        order.payment_status = 'failed'
+        order.save(update_fields=['status', 'payment_status'])
+        order.record_status_update('cancelled', 'Payment initialization failed.')
         return Response({'error': str(e)}, status=500)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def verify_razorpay_payment(request):
-    """Step 2: Verify the payment signature on the backend."""
+    """Step 2: Verify the payment signature on the backend and finalize stock."""
     razorpay_order_id = request.data.get('razorpay_order_id', '')
     razorpay_payment_id = request.data.get('razorpay_payment_id', '')
     razorpay_signature = request.data.get('razorpay_signature', '')
 
     try:
-        order = Order.objects.get(razorpay_order_id=razorpay_order_id, user=request.user)
+        order = Order.objects.prefetch_related('items__product').get(razorpay_order_id=razorpay_order_id, user=request.user)
     except Order.DoesNotExist:
         return Response({'error': 'Order not found'}, status=404)
 
-    # Verify signature
+    if order.payment_status == 'paid':
+        return Response({'message': 'Payment already verified.', 'order_number': order.order_number})
+
     msg = f"{razorpay_order_id}|{razorpay_payment_id}"
     generated_sig = hmac.new(
         key=settings.RAZORPAY_KEY_SECRET.encode(),
@@ -533,21 +603,39 @@ def verify_razorpay_payment(request):
         order.payment_status = 'failed'
         order.status = 'cancelled'
         order.save(update_fields=['payment_status', 'status'])
+        order.record_status_update('cancelled', 'Payment verification failed.')
         return Response({'error': 'Payment verification failed'}, status=400)
 
-    # Payment verified
-    order.razorpay_payment_id = razorpay_payment_id
-    order.razorpay_signature = razorpay_signature
-    order.payment_status = 'paid'
-    order.status = 'confirmed'
-    order.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'payment_status', 'status'])
+    try:
+        with transaction.atomic():
+            for item in order.items.select_related('product'):
+                if item.quantity > item.product.stock:
+                    raise ValueError(f'Only {item.product.stock} units of "{item.product.name}" available')
+                item.product.stock -= item.quantity
+                item.product.save(update_fields=['stock'])
 
-    _send_order_confirmation(order)
+            order.razorpay_payment_id = razorpay_payment_id
+            order.razorpay_signature = razorpay_signature
+            order.payment_status = 'paid'
+            order.status = 'confirmed'
+            order.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'payment_status', 'status'])
+            order.record_status_update('confirmed', 'Razorpay payment verified and order confirmed.')
 
-    return Response({
-        'message': 'Payment verified. Order confirmed!',
-        'order_number': order.order_number,
-    })
+        cart = Cart.objects.filter(user=request.user).first()
+        if cart:
+            cart.items.all().delete()
+
+        _send_order_confirmation(order)
+        return Response({
+            'message': 'Payment verified. Order confirmed!',
+            'order_number': order.order_number,
+        })
+    except ValueError as exc:
+        order.payment_status = 'failed'
+        order.status = 'cancelled'
+        order.save(update_fields=['payment_status', 'status'])
+        order.record_status_update('cancelled', f'Order could not be finalized: {exc}')
+        return Response({'error': str(exc)}, status=400)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -617,6 +705,69 @@ def validate_coupon(request):
         'discount_type': coupon.discount_type,
         'discount_value': str(coupon.discount_value),
         'discount_amount': str(discount),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def ai_shopping_assistant(request):
+    """Recommend real products from the catalog based on a user's shopping query."""
+    message = (request.data.get('message') or request.data.get('query') or '').strip()
+    budget = request.data.get('budget')
+    category_slug = (request.data.get('category') or '').strip()
+    limit = int(request.data.get('limit', 3) or 3)
+    limit = max(1, min(6, limit))
+
+    qs = Product.objects.filter(is_active=True).select_related('category')
+    if category_slug:
+        qs = qs.filter(category__slug=category_slug)
+
+    if budget is not None and str(budget).strip():
+        try:
+            budget_value = float(budget)
+            qs = qs.filter(price__lte=budget_value)
+        except ValueError:
+            budget_value = None
+    else:
+        budget_value = None
+
+    extracted_budget = None
+    if not budget_value and message:
+        matches = re.findall(r'\d{3,7}', message)
+        if matches:
+            extracted_budget = min(float(num) for num in matches)
+            qs = qs.filter(price__lte=extracted_budget)
+
+    if message:
+        tokens = [token.lower() for token in re.split(r'[^a-zA-Z0-9]+', message) if len(token) > 2]
+        if tokens:
+            filters = Q()
+            for token in tokens:
+                filters |= Q(name__icontains=token) | Q(description__icontains=token) | Q(specifications__icontains=token) | Q(category__name__icontains=token)
+            qs = qs.filter(filters)
+
+    if not qs.exists():
+        qs = Product.objects.filter(is_active=True).select_related('category')
+
+    qs = qs.order_by('-is_featured', '-created_at')
+    products = list(qs[:limit])
+    if not products:
+        products = list(Product.objects.filter(is_active=True).select_related('category')[:limit])
+
+    serializer = ProductSerializer(products, many=True, context={'request': request})
+    budget_text = budget_value or extracted_budget
+    assistant_reply = f"Based on your request, I found {len(serializer.data)} product option(s)"
+    if message:
+        assistant_reply += f" for: '{message}'"
+    if budget_text:
+        assistant_reply += f" within ₹{int(budget_text):,}."
+    else:
+        assistant_reply += "."
+
+    return Response({
+        'assistant_reply': assistant_reply,
+        'budget': budget_text,
+        'recommendations': serializer.data,
     })
 
 

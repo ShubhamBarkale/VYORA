@@ -41,6 +41,7 @@ urlpatterns = [
 
     # ── Coupon ────────────────────────────────────────────────────────────────
     path('coupon/validate/', views.validate_coupon),
+    path('ai/assistant/', views.ai_shopping_assistant),
 
     # ── Orders ────────────────────────────────────────────────────────────────
     path('orders/create/', views.create_order),
