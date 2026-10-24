@@ -31,6 +31,7 @@ from .serializers import (
     AddressSerializer, WishlistSerializer,
     ReviewSerializer, CouponSerializer,
 )
+from .ai_assistant import build_assistant_result
 
 
 def _is_demo_payment_mode():
@@ -767,70 +768,55 @@ def validate_coupon(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def ai_shopping_assistant(request):
-    """Recommend real products from the catalog based on a user's shopping query."""
-    message = (request.data.get('message') or request.data.get('query') or '').strip()
-    budget = request.data.get('budget')
-    category_slug = (request.data.get('category') or '').strip()
-    limit = int(request.data.get('limit', 3) or 3)
-    limit = max(1, min(6, limit))
+    message = request.data.get('message', request.data.get('query', ''))
+    action = request.data.get('action', '')
+    product_ids = request.data.get('product_ids', [])
+    if request.data.get('product_id') is not None and not product_ids:
+        product_ids = [request.data.get('product_id')]
 
-    qs = Product.objects.filter(is_active=True).select_related('category')
-    if category_slug:
-        qs = qs.filter(category__slug=category_slug)
+    if not isinstance(message, str) or len(message) > 1000:
+        return Response({'error': 'Message must be text up to 1000 characters.'}, status=400)
+    if not isinstance(action, str) or action not in {
+        '', 'search', 'recommend', 'compare', 'reviews', 'order_tracking',
+    }:
+        return Response({'error': 'Unsupported assistant action.'}, status=400)
+    if not isinstance(product_ids, list) or len(product_ids) > 3:
+        return Response({'error': 'Select up to three catalog products.'}, status=400)
 
-    if budget is not None and str(budget).strip():
-        try:
-            budget_value = float(budget)
-            qs = qs.filter(price__lte=budget_value)
-        except ValueError:
-            budget_value = None
-    else:
-        budget_value = None
+    try:
+        limit = int(request.data.get('limit', 4))
+    except (TypeError, ValueError):
+        return Response({'error': 'Limit must be a whole number.'}, status=400)
+    if not 1 <= limit <= 6:
+        return Response({'error': 'Limit must be between 1 and 6.'}, status=400)
 
-    extracted_budget = None
-    if not budget_value and message:
-        matches = re.findall(r'\d{3,7}', message)
-        if matches:
-            extracted_budget = min(float(num) for num in matches)
-            qs = qs.filter(price__lte=extracted_budget)
+    order_number = request.data.get('order_number', '')
+    if not isinstance(order_number, str) or len(order_number) > 20:
+        return Response({'error': 'Enter a valid order number.'}, status=400)
 
-    if message:
-        tokens = [token.lower() for token in re.split(r'[^a-zA-Z0-9]+', message) if len(token) > 2]
-        if tokens:
-            filters = Q()
-            for token in tokens:
-                filters |= Q(name__icontains=token) | Q(description__icontains=token) | Q(specifications__icontains=token) | Q(category__name__icontains=token)
-            qs = qs.filter(filters)
+    try:
+        result = build_assistant_result(
+            message=message.strip(),
+            user=request.user,
+            action=action,
+            budget=request.data.get('budget'),
+            product_ids=product_ids,
+            order_number=order_number,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=400)
 
-    if not qs.exists():
-        qs = Product.objects.filter(is_active=True).select_related('category')
-
-    qs = qs.order_by('-is_featured', '-created_at')
-    products = list(qs[:limit])
-    if not products:
-        products = list(Product.objects.filter(is_active=True).select_related('category')[:limit])
-
-    serializer = ProductSerializer(products, many=True, context={'request': request})
-    budget_text = budget_value or extracted_budget
-    assistant_reply = f"I found {len(serializer.data)} product option(s) from the current catalog"
-    if message:
-        assistant_reply += f" for '{message}'"
-    if budget_text:
-        assistant_reply += f" within ₹{int(budget_text):,}."
-    elif not message:
-        assistant_reply = 'Demo AI mode is active: try asking for a product type, use case, or budget limit.'
-    else:
-        assistant_reply += "."
-
-    if not serializer.data:
-        assistant_reply = 'No exact match was found in the catalog, so I am showing the best available demo picks.'
-
-    return Response({
-        'assistant_reply': assistant_reply,
-        'budget': budget_text,
-        'recommendations': serializer.data,
-        'demo_mode': True,
-    })
+    data = result['data']
+    recommendations = data.get('recommendations')
+    if recommendations is not None:
+        serialized = ProductSerializer(
+            recommendations, many=True, context={'request': request},
+        ).data
+        data['recommendations'] = serialized
+        if data.get('comparison') is not None:
+            data['comparison'] = serialized[:2]
+    return Response(data, status=result['status'])
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
