@@ -95,6 +95,7 @@ class Order(models.Model):
         ('confirmed', 'Confirmed'),
         ('processing', 'Processing'),
         ('shipped', 'Shipped'),
+        ('out_for_delivery', 'Out for Delivery'),
         ('delivered', 'Delivered'),
         ('cancelled', 'Cancelled'),
     ]
@@ -172,6 +173,7 @@ class Order(models.Model):
             'confirmed': 'Order confirmed and being prepared.',
             'processing': 'Order is being processed.',
             'shipped': 'Order has been shipped.',
+            'out_for_delivery': 'Order is out for delivery. Demo tracking status only.',
             'delivered': 'Order delivered successfully.',
             'cancelled': 'Order was cancelled.',
         }

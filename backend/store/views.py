@@ -33,6 +33,10 @@ from .serializers import (
 )
 
 
+def _is_demo_payment_mode():
+    return not bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PRODUCTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -494,10 +498,11 @@ def get_order_detail(request, order_number):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_razorpay_order(request):
-    """Step 1: Create a pending order and return Razorpay metadata."""
-    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
-        return Response({'error': 'Razorpay is not configured. Please add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to your .env'}, status=503)
+    """Step 1: Create a pending order and return Razorpay metadata.
 
+    In demo mode, this returns a safe mock payment payload so the portfolio app can
+    test the checkout flow without real third-party secrets or paid APIs.
+    """
     data = request.data
     validation_error = _validate_shipping_data(data)
     if validation_error[0] is not None:
@@ -548,8 +553,21 @@ def create_razorpay_order(request):
             price=item.product.discounted_price,
         )
 
-    order.record_status_update('pending', 'Awaiting Razorpay payment confirmation.')
+    order.record_status_update('pending', 'Awaiting payment confirmation.')
     amount_paise = int(float(order.total_amount) * 100)
+
+    if _is_demo_payment_mode():
+        order.razorpay_order_id = f'demo_{order.order_number}'
+        order.save(update_fields=['razorpay_order_id'])
+        return Response({
+            'demo_mode': True,
+            'razorpay_order_id': order.razorpay_order_id,
+            'amount': amount_paise,
+            'currency': 'INR',
+            'order_number': order.order_number,
+            'key_id': 'demo_key',
+            'message': 'Demo payment mode is active. Confirm the payment to simulate a successful checkout.',
+        })
 
     try:
         client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
@@ -579,10 +597,15 @@ def create_razorpay_order(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def verify_razorpay_payment(request):
-    """Step 2: Verify the payment signature on the backend and finalize stock."""
+    """Step 2: Verify the payment signature on the backend and finalize stock.
+
+    Demo mode explicitly confirms the transaction only when the frontend sends the
+    demo flag. This prevents unpaid orders from being marked as paid.
+    """
     razorpay_order_id = request.data.get('razorpay_order_id', '')
     razorpay_payment_id = request.data.get('razorpay_payment_id', '')
     razorpay_signature = request.data.get('razorpay_signature', '')
+    demo_mode = request.data.get('demo', False) or request.data.get('demo_mode', False)
 
     try:
         order = Order.objects.prefetch_related('items__product').get(razorpay_order_id=razorpay_order_id, user=request.user)
@@ -591,6 +614,39 @@ def verify_razorpay_payment(request):
 
     if order.payment_status == 'paid':
         return Response({'message': 'Payment already verified.', 'order_number': order.order_number})
+
+    if _is_demo_payment_mode() or demo_mode:
+        try:
+            with transaction.atomic():
+                for item in order.items.select_related('product'):
+                    if item.quantity > item.product.stock:
+                        raise ValueError(f'Only {item.product.stock} units of "{item.product.name}" available')
+                    item.product.stock -= item.quantity
+                    item.product.save(update_fields=['stock'])
+
+                order.razorpay_payment_id = razorpay_payment_id or f'demo_{order.order_number}'
+                order.razorpay_signature = razorpay_signature or 'demo_signature'
+                order.payment_status = 'paid'
+                order.status = 'confirmed'
+                order.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'payment_status', 'status'])
+                order.record_status_update('confirmed', 'Demo payment verified. This is a local test order.')
+
+            cart = Cart.objects.filter(user=request.user).first()
+            if cart:
+                cart.items.all().delete()
+
+            _send_order_confirmation(order)
+            return Response({
+                'message': 'Demo payment verified. Order confirmed!',
+                'order_number': order.order_number,
+                'demo_mode': True,
+            })
+        except ValueError as exc:
+            order.payment_status = 'failed'
+            order.status = 'cancelled'
+            order.save(update_fields=['payment_status', 'status'])
+            order.record_status_update('cancelled', f'Order could not be finalized: {exc}')
+            return Response({'error': str(exc)}, status=400)
 
     msg = f"{razorpay_order_id}|{razorpay_payment_id}"
     generated_sig = hmac.new(
@@ -756,18 +812,24 @@ def ai_shopping_assistant(request):
 
     serializer = ProductSerializer(products, many=True, context={'request': request})
     budget_text = budget_value or extracted_budget
-    assistant_reply = f"Based on your request, I found {len(serializer.data)} product option(s)"
+    assistant_reply = f"I found {len(serializer.data)} product option(s) from the current catalog"
     if message:
-        assistant_reply += f" for: '{message}'"
+        assistant_reply += f" for '{message}'"
     if budget_text:
         assistant_reply += f" within ₹{int(budget_text):,}."
+    elif not message:
+        assistant_reply = 'Demo AI mode is active: try asking for a product type, use case, or budget limit.'
     else:
         assistant_reply += "."
+
+    if not serializer.data:
+        assistant_reply = 'No exact match was found in the catalog, so I am showing the best available demo picks.'
 
     return Response({
         'assistant_reply': assistant_reply,
         'budget': budget_text,
         'recommendations': serializer.data,
+        'demo_mode': True,
     })
 
 

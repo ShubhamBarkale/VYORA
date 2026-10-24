@@ -1,17 +1,83 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Bot, Sparkles, Send, ArrowRight } from 'lucide-react';
+import { Bot, Sparkles, Send, ArrowRight, Grip } from 'lucide-react';
 
 const BASE = import.meta.env.VITE_DJANGO_BASE_URL;
 
 export default function AIShoppingAssistant() {
   const [open, setOpen] = useState(true);
+  const [position, setPosition] = useState(null);
   const [query, setQuery] = useState('Recommend a good product under ₹3000 for daily use');
   const [loading, setLoading] = useState(false);
+  const dragRef = useRef(null);
+  const draggedRef = useRef(false);
+  const widgetRef = useRef(null);
   const [result, setResult] = useState({
-    assistant_reply: 'Ask for a product recommendation based on your budget, use case, or category.',
+    assistant_reply: 'Demo AI mode is active. Ask for a budget, use case, or category and I will scan the product catalog for suggestions.',
     recommendations: [],
   });
+
+  const startDragging = (e) => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+
+    const bounds = widgetRef.current.getBoundingClientRect();
+    dragRef.current = {
+      pointerId: e.pointerId,
+      offsetX: e.clientX - bounds.left,
+      offsetY: e.clientY - bounds.top,
+    };
+    draggedRef.current = false;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setPosition((current) => (
+      current?.left === bounds.left && current?.top === bounds.top
+        ? current
+        : { left: bounds.left, top: bounds.top }
+    ));
+  };
+
+  const drag = (e) => {
+    if (!dragRef.current || dragRef.current.pointerId !== e.pointerId) return;
+
+    const bounds = widgetRef.current.getBoundingClientRect();
+    const maxLeft = Math.max(0, window.innerWidth - bounds.width);
+    const maxTop = Math.max(0, window.innerHeight - bounds.height);
+    const left = Math.min(
+      Math.max(0, e.clientX - dragRef.current.offsetX),
+      maxLeft,
+    );
+    const top = Math.min(
+      Math.max(0, e.clientY - dragRef.current.offsetY),
+      maxTop,
+    );
+    draggedRef.current = true;
+    setPosition({ left, top });
+  };
+
+  const stopDragging = (e) => {
+    if (dragRef.current?.pointerId === e.pointerId) dragRef.current = null;
+  };
+
+  const handleCollapsedClick = () => {
+    if (draggedRef.current) {
+      draggedRef.current = false;
+      return;
+    }
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    const keepInViewport = () => {
+      if (!position || !widgetRef.current) return;
+      const bounds = widgetRef.current.getBoundingClientRect();
+      const left = Math.max(0, Math.min(position.left, window.innerWidth - bounds.width));
+      const top = Math.max(0, Math.min(position.top, window.innerHeight - bounds.height));
+      if (left !== position.left || top !== position.top) setPosition({ left, top });
+    };
+
+    keepInViewport();
+    window.addEventListener('resize', keepInViewport);
+    return () => window.removeEventListener('resize', keepInViewport);
+  }, [open, position]);
 
   const askAssistant = async (e) => {
     e.preventDefault();
@@ -39,17 +105,32 @@ export default function AIShoppingAssistant() {
   };
 
   return (
-    <div className="fixed bottom-20 right-4 z-40 w-[min(360px,calc(100vw-1.5rem))]">
+    <div
+      ref={widgetRef}
+      style={position ? { left: position.left, top: position.top } : undefined}
+      className={`fixed z-40 w-[min(360px,calc(100vw-1.5rem))] ${position ? '' : 'right-4 bottom-20'}`}
+    >
       {!open ? (
         <button
-          onClick={() => setOpen(true)}
-          className="ml-auto flex items-center gap-2 rounded-full bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-lg hover:bg-indigo-500 transition"
+          onClick={handleCollapsedClick}
+          onPointerDown={startDragging}
+          onPointerMove={drag}
+          onPointerUp={stopDragging}
+          onPointerCancel={stopDragging}
+          className="ml-auto flex touch-none cursor-move items-center gap-2 rounded-full bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-indigo-500"
         >
           <Bot size={16} /> AI Assistant
         </button>
       ) : (
         <div className="rounded-2xl border border-indigo-100 bg-white/95 shadow-2xl backdrop-blur-md dark:border-slate-700 dark:bg-slate-900/95">
-          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-700">
+          <div
+            onPointerDown={startDragging}
+            onPointerMove={drag}
+            onPointerUp={stopDragging}
+            onPointerCancel={stopDragging}
+            className="flex cursor-move touch-none items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-700"
+            title="Drag to move VYORA AI"
+          >
             <div className="flex items-center gap-2">
               <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-100 text-indigo-600 dark:bg-indigo-900/30 dark:text-indigo-300">
                 <Sparkles size={16} />
@@ -59,6 +140,7 @@ export default function AIShoppingAssistant() {
                 <p className="text-[10px] text-slate-500 dark:text-slate-400">Smart shopping help</p>
               </div>
             </div>
+            <Grip size={16} className="mr-2 text-slate-400" aria-hidden="true" />
             <button
               onClick={() => setOpen(false)}
               className="text-xs text-slate-500 hover:text-slate-800 dark:text-slate-300 dark:hover:text-white"

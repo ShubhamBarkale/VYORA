@@ -70,6 +70,23 @@ export default function CheckoutPage() {
       const res  = await authFetch(`${BASE}/api/payment/create/`, { method: 'POST', body: JSON.stringify(payload) });
       const data = await res.json();
       if (!res.ok) { toast.error(data.error || 'Payment init failed'); setLoading(false); return; }
+
+      if (data.demo_mode) {
+        toast.success('Demo payment mode is active. Confirming the test checkout now…');
+        const demoPayload = {
+          razorpay_order_id: data.razorpay_order_id,
+          razorpay_payment_id: `demo_${Date.now()}`,
+          razorpay_signature: `demo_signature_${Date.now()}`,
+          demo: true,
+        };
+        const vRes  = await authFetch(`${BASE}/api/payment/verify/`, { method: 'POST', body: JSON.stringify(demoPayload) });
+        const vData = await vRes.json();
+        if (vRes.ok) { clearCart(); navigate(`/order-success/${vData.order_number}`); }
+        else toast.error(vData.error || 'Demo verification failed');
+        setLoading(false);
+        return;
+      }
+
       const options = {
         key: data.key_id, amount: data.amount, currency: data.currency,
         name: 'VYORA', description: `Order ${data.order_number}`,

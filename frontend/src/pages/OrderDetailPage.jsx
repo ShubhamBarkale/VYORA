@@ -4,9 +4,9 @@ import { ArrowLeft, MapPin, CreditCard, Package, Check } from 'lucide-react';
 import { authFetch } from '../utils/auth';
 
 const BASE = import.meta.env.VITE_DJANGO_BASE_URL;
-const STEPS = ['Ordered','Confirmed','Processing','Shipped','Delivered'];
-const STEP_MAP = { pending:0, confirmed:1, processing:2, shipped:3, delivered:4 };
-const S_COLORS = { pending:'bg-amber-50 text-amber-700', confirmed:'bg-blue-50 text-blue-700', processing:'bg-indigo-50 text-indigo-700', shipped:'bg-purple-50 text-purple-700', delivered:'bg-emerald-50 text-emerald-700', cancelled:'bg-red-50 text-red-700' };
+const STEPS = ['Ordered','Confirmed','Shipped','Out for Delivery','Delivered'];
+const STEP_MAP = { pending:0, confirmed:1, shipped:2, out_for_delivery:3, delivered:4 };
+const S_COLORS = { pending:'bg-amber-50 text-amber-700', confirmed:'bg-blue-50 text-blue-700', processing:'bg-indigo-50 text-indigo-700', shipped:'bg-purple-50 text-purple-700', out_for_delivery:'bg-violet-50 text-violet-700', delivered:'bg-emerald-50 text-emerald-700', cancelled:'bg-red-50 text-red-700' };
 
 export default function OrderDetailPage() {
   const { orderNumber } = useParams();
@@ -30,6 +30,7 @@ export default function OrderDetailPage() {
 
   const stepIdx = STEP_MAP[order.status] ?? -1;
   const timeline = Array.isArray(order.status_history) ? order.status_history : [];
+  const isDemoTracking = timeline.some((event) => /demo|test|sample/i.test(event.note || '')) || order.payment_method === 'RAZORPAY';
 
   return (
     <div style={{ background:'var(--vyora-bg)' }} className="pb-24 md:pb-8 page-transition">
@@ -80,7 +81,10 @@ export default function OrderDetailPage() {
 
         {timeline.length > 0 && (
           <div className="vyora-card p-5 mb-5" style={{ '--shadow-hover':'none' }}>
-            <h2 className="text-sm font-bold uppercase tracking-widest mb-4" style={{ color:'var(--vyora-muted)' }}>Tracking Timeline</h2>
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <h2 className="text-sm font-bold uppercase tracking-widest" style={{ color:'var(--vyora-muted)' }}>Tracking Timeline</h2>
+              {isDemoTracking && <span className="rounded-full bg-amber-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">Demo tracking</span>}
+            </div>
             <div className="space-y-4">
               {timeline.map((event, index) => (
                 <div key={`${event.status}-${event.created_at}-${index}`} className="flex gap-3">
