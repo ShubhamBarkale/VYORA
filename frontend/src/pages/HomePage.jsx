@@ -253,9 +253,8 @@ export default function HomePage() {
 
       {/* Hero */}
       <section className="relative hero-gradient overflow-hidden">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 sm:py-24">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
-            <div>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 sm:py-28">
+          <div className="max-w-2xl">
               <span className="hero-text-1 inline-block text-sm font-semibold text-indigo-300 bg-white/10 rounded-full px-4 py-1.5 mb-5">
                 {slide.badge}
               </span>
@@ -267,7 +266,7 @@ export default function HomePage() {
               </p>
               <div className="hero-text-4 flex flex-wrap gap-3">
                 <Link to={slide.cta1.to}
-                  className="px-7 py-3.5 bg-white text-indigo-700 font-bold rounded-2xl hover:shadow-xl hover:-translate-y-0.5 transition-all duration-200 flex items-center gap-2">
+                  className="px-7 py-3.5 bg-indigo-600 text-white font-bold rounded-2xl hover:bg-indigo-700 hover:shadow-xl hover:-translate-y-0.5 transition-all duration-200 flex items-center gap-2">
                   {slide.cta1.label} <ArrowRight size={16} />
                 </Link>
                 <Link to={slide.cta2.to}
@@ -275,15 +274,13 @@ export default function HomePage() {
                   {slide.cta2.label}
                 </Link>
               </div>
-              <div className="flex gap-2 mt-8">
-                {HERO_SLIDES.map((_, i) => (
-                  <button key={i} onClick={() => setHeroIdx(i)}
-                    className={`h-1.5 rounded-full transition-all duration-300 ${i === heroIdx ? 'w-8 bg-white' : 'w-3 bg-white/30'}`} />
-                ))}
-              </div>
-            </div>
-            <div className="hidden lg:flex items-center justify-center">
-              <div className="hero-img text-[160px] animate-float select-none">{slide.art}</div>
+            <div className="flex gap-2 mt-8">
+              {HERO_SLIDES.map((_, i) => (
+                <button key={i} onClick={() => setHeroIdx(i)}
+                  aria-label={`Show hero slide ${i + 1}`}
+                  aria-current={i === heroIdx ? 'true' : undefined}
+                  className={`h-1.5 rounded-full transition-all duration-300 ${i === heroIdx ? 'w-8 bg-white' : 'w-3 bg-white/30'}`} />
+              ))}
             </div>
           </div>
         </div>
@@ -335,7 +332,7 @@ export default function HomePage() {
         <ProductRow title="Trending Now"    subtitle="Most popular products this week" viewAll="/shop?sort=featured" products={trending}  loading={loading} />
 
         {/* Promo banner */}
-        <section className="rounded-3xl overflow-hidden bg-gradient-to-r from-indigo-600 via-violet-600 to-purple-700 p-8 sm:p-12">
+        <section className="rounded-3xl overflow-hidden promo-gradient p-8 sm:p-12">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-8 items-center">
             <div>
               <span className="inline-block text-indigo-200 text-xs font-bold uppercase tracking-widest mb-3">Limited Offer</span>
@@ -345,7 +342,7 @@ export default function HomePage() {
                 <strong className="text-white bg-white/20 px-2 py-0.5 rounded-lg">WELCOME10</strong>{' '}
                 for 10% off your first order.
               </p>
-              <Link to="/shop" className="inline-flex items-center gap-2 bg-white text-indigo-700 font-bold px-6 py-3 rounded-2xl hover:shadow-xl hover:-translate-y-0.5 transition-all">
+              <Link to="/shop" className="inline-flex items-center gap-2 bg-indigo-600 text-white font-bold px-6 py-3 rounded-2xl hover:bg-indigo-700 hover:shadow-xl hover:-translate-y-0.5 transition-all">
                 Shop Collection <ArrowRight size={16} />
               </Link>
             </div>

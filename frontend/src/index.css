@@ -1,34 +1,72 @@
 @import "tailwindcss";
 
+@theme {
+  --color-indigo-50: #fdf4ff;
+  --color-indigo-100: #fae8ff;
+  --color-indigo-200: #f5d0fe;
+  --color-indigo-300: #f0abfc;
+  --color-indigo-400: #e879f9;
+  --color-indigo-500: #d946ef;
+  --color-indigo-600: #c026d3;
+  --color-indigo-700: #a21caf;
+  --color-indigo-800: #86198f;
+  --color-indigo-900: #701a75;
+  --color-indigo-950: #4a044e;
+  --color-violet-50: #fdf4ff;
+  --color-violet-100: #fae8ff;
+  --color-violet-200: #f5d0fe;
+  --color-violet-300: #f0abfc;
+  --color-violet-400: #e879f9;
+  --color-violet-500: #d946ef;
+  --color-violet-600: #c026d3;
+  --color-violet-700: #a21caf;
+  --color-violet-800: #86198f;
+  --color-violet-900: #701a75;
+  --color-violet-950: #4a044e;
+  --color-slate-50: #faf9fb;
+  --color-slate-100: #f4f1f5;
+  --color-slate-200: #e8e3eb;
+  --color-slate-300: #d1c9d5;
+  --color-slate-400: #a99eaf;
+  --color-slate-500: #817684;
+  --color-slate-600: #665c69;
+  --color-slate-700: #4a424e;
+  --color-slate-800: #2f2934;
+  --color-slate-900: #1c1820;
+  --color-slate-950: #100e12;
+}
+
 /* ═══════════════════════════════════════════════
    VYORA — Design System Variables
 ═══════════════════════════════════════════════ */
 :root {
-  --vyora-indigo:   #6366F1;
-  --vyora-violet:   #8B5CF6;
-  --vyora-charcoal: #111827;
-  --vyora-bg:       #F8FAFC;
+  --vyora-accent:   #d946ef;
+  --vyora-accent-strong: #c026d3;
+  --vyora-indigo:   var(--vyora-accent);
+  --vyora-violet:   var(--vyora-accent-strong);
+  --vyora-charcoal: #111014;
+  --vyora-bg:       #faf8fb;
   --vyora-card:     #FFFFFF;
-  --vyora-text:     #0F172A;
-  --vyora-muted:    #64748B;
+  --vyora-text:     #19151b;
+  --vyora-muted:    #756d79;
   --vyora-success:  #10B981;
   --vyora-warning:  #F59E0B;
   --vyora-error:    #EF4444;
-  --vyora-border:   #E2E8F0;
+  --vyora-border:   #e9e2eb;
   --radius-card:    16px;
   --shadow-card:    0 1px 3px rgba(0,0,0,.06), 0 4px 12px rgba(0,0,0,.04);
-  --shadow-hover:   0 8px 24px rgba(99,102,241,.14);
+  --shadow-hover:   0 8px 24px rgba(192,38,211,.14);
   --transition:     200ms cubic-bezier(.4,0,.2,1);
 }
 
 /* Dark mode */
 .dark {
-  --vyora-bg:    #0F172A;
-  --vyora-card:  #1E293B;
-  --vyora-text:  #F8FAFC;
-  --vyora-muted: #94A3B8;
-  --vyora-border:#334155;
-  --shadow-card: 0 1px 3px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.2);
+  --vyora-bg:    #0d0c10;
+  --vyora-card:  #17151b;
+  --vyora-text:  #f8f5fa;
+  --vyora-muted: #aaa1ae;
+  --vyora-border:#302b34;
+  --shadow-card: 0 1px 3px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.22);
 }
 
 /* ── Base ─────────────────────────────────────── */
@@ -85,7 +123,7 @@ body {
   animation: shimmer 1.4s ease-in-out infinite;
 }
 .dark .skeleton {
-  background: linear-gradient(90deg,#1e293b 25%,#334155 50%,#1e293b 75%);
+  background: linear-gradient(90deg,#1c1820 25%,#302a34 50%,#1c1820 75%);
   background-size: 200% 100%;
 }
 
@@ -96,8 +134,8 @@ body {
   border: 1px solid rgba(255,255,255,.3);
 }
 .dark .glass {
-  background: rgba(15,23,42,.85);
-  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(13,12,16,.88);
+  border: 1px solid rgba(255,255,255,.07);
 }
 
 /* ── Card ─────────────────────────────────────── */
@@ -113,17 +151,23 @@ body {
   transform: translateY(-2px);
 }
 
+.promo-gradient {
+  background:
+    radial-gradient(ellipse at 85% 15%, rgba(217,70,239,.28), transparent 38%),
+    linear-gradient(120deg,#141116 0%,#241329 55%,#3a1641 100%);
+}
+
 /* ── Buttons ─────────────────────────────────── */
 .btn-primary {
   display:inline-flex;align-items:center;justify-content:center;gap:.5rem;
-  background: var(--vyora-indigo);
+  background: var(--vyora-accent-strong);
   color: #fff;
   font-weight: 600;
   border-radius: 12px;
   padding: .625rem 1.5rem;
   transition: background var(--transition), transform var(--transition), box-shadow var(--transition);
 }
-.btn-primary:hover  { background:#4f46e5; box-shadow:0 4px 14px rgba(99,102,241,.35); transform:translateY(-1px); }
+.btn-primary:hover  { background:#a21caf; box-shadow:0 4px 14px rgba(192,38,211,.3); transform:translateY(-1px); }
 .btn-primary:active { transform:translateY(0); box-shadow:none; }
 .btn-primary:disabled { opacity:.5; cursor:not-allowed; transform:none; box-shadow:none; }
 
@@ -169,14 +213,20 @@ body {
 
 /* ── Announcement bar ─────────────────────────── */
 .announcement-bar {
-  background: linear-gradient(90deg,#6366f1 0%,#8b5cf6 50%,#6366f1 100%);
+  background: linear-gradient(90deg,#311a35 0%,#54245b 50%,#311a35 100%);
   background-size: 200% 100%;
   animation: shimmer 4s linear infinite;
 }
 
 /* ── Hero gradient ────────────────────────────── */
 .hero-gradient {
-  background: linear-gradient(135deg,#0f172a 0%,#1e1b4b 40%,#312e81 70%,#4c1d95 100%);
+  background-color: #0b0a0e;
+  background-image:
+    linear-gradient(90deg,rgba(11,10,14,.91) 0%,rgba(17,13,20,.78) 48%,rgba(18,12,20,.52) 100%),
+    linear-gradient(0deg,rgba(11,10,14,.32),transparent 55%),
+    url('/vyora-store-hero.jpg');
+  background-position: center;
+  background-size: cover;
 }
 
 /* ── Section heading ─────────────────────────── */
@@ -226,8 +276,8 @@ body {
 :focus-visible { outline:2px solid var(--vyora-indigo); outline-offset:2px; }
 
 /* ── Dark mode base overrides ────────────────── */
-.dark body  { background-color:#0f172a; color:#f8fafc; }
-.dark .vyora-input { background:#1e293b; border-color:#334155; color:#f8fafc; }
+.dark body  { background-color:var(--vyora-bg); color:var(--vyora-text); }
+.dark .vyora-input { background:var(--vyora-card); border-color:var(--vyora-border); color:var(--vyora-text); }
 
 /* ════════════════════════════════════════════════════════════════
    VYORA — Professional Animation Layer
