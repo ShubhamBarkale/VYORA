@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowRight, Star, Truck, Shield, RotateCcw,
@@ -65,9 +65,18 @@ const HERO_SLIDES = [
   },
 ];
 
+const HERO_PRODUCTS = [
+  { id: 'dress', illustration: '👗', name: 'Fashion dress' },
+  { id: 'phone', illustration: '📱', name: 'Mobile phone' },
+  { id: 'shoes', illustration: '👟', name: 'Shoes' },
+  { id: 'handbag', illustration: '👜', name: 'Handbag' },
+  { id: 'headphones', illustration: '🎧', name: 'Headphones' },
+  { id: 'shopping', illustration: '🛍️', name: 'Shopping bag' },
+];
+
 /* ── Countdown hook ─────────────────────────────────────────────── */
 function useCountdown(targetDate) {
-  const calc = () => {
+  const calc = useCallback(() => {
     const diff = new Date(targetDate) - new Date();
     if (diff <= 0) return { h: 0, m: 0, s: 0 };
     return {
@@ -75,12 +84,12 @@ function useCountdown(targetDate) {
       m: Math.floor((diff / 60000) % 60),
       s: Math.floor((diff / 1000) % 60),
     };
-  };
+  }, [targetDate]);
   const [time, setTime] = useState(calc);
   useEffect(() => {
     const id = setInterval(() => setTime(calc()), 1000);
     return () => clearInterval(id);
-  }, [targetDate]);
+  }, [calc]);
   return time;
 }
 
@@ -202,7 +211,6 @@ function FlashDealsSection({ discounted, h, m, s }) {
 
 /* ── Main page component ────────────────────────────────────────── */
 export default function HomePage() {
-  const navigate = useNavigate();
   const { items: recentlyViewed } = useRecentlyViewed();
 
   const [featured,   setFeatured]   = useState([]);
@@ -213,6 +221,7 @@ export default function HomePage() {
   const [email,      setEmail]      = useState('');
   const [subscribed, setSubscribed] = useState(false);
   const [heroIdx,    setHeroIdx]    = useState(0);
+  const [heroProductIdx, setHeroProductIdx] = useState(0);
 
   /* Flash deal timer — fixed end time, won't shift on re-renders */
   const dealEndRef = useRef(new Date(Date.now() + 6 * 3600 * 1000).toISOString());
@@ -223,6 +232,15 @@ export default function HomePage() {
     const id = setInterval(() => setHeroIdx(i => (i + 1) % HERO_SLIDES.length), 5000);
     return () => clearInterval(id);
   }, []);                          /* ← empty deps — safe because HERO_SLIDES is module-level */
+
+  useEffect(() => {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
+    const id = setInterval(
+      () => setHeroProductIdx(i => (i + 1) % HERO_PRODUCTS.length),
+      1800,
+    );
+    return () => clearInterval(id);
+  }, []);
 
   /* Fetch homepage products — runs once on mount */
   useEffect(() => {
@@ -253,8 +271,9 @@ export default function HomePage() {
 
       {/* Hero */}
       <section className="relative hero-gradient overflow-hidden">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 sm:py-28">
-          <div className="max-w-2xl">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14 sm:py-20">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12 items-center">
+            <div className="relative z-10 max-w-2xl">
               <span className="hero-text-1 inline-block text-sm font-semibold text-indigo-300 bg-white/10 rounded-full px-4 py-1.5 mb-5">
                 {slide.badge}
               </span>
@@ -274,13 +293,29 @@ export default function HomePage() {
                   {slide.cta2.label}
                 </Link>
               </div>
-            <div className="flex gap-2 mt-8">
-              {HERO_SLIDES.map((_, i) => (
-                <button key={i} onClick={() => setHeroIdx(i)}
-                  aria-label={`Show hero slide ${i + 1}`}
-                  aria-current={i === heroIdx ? 'true' : undefined}
-                  className={`h-1.5 rounded-full transition-all duration-300 ${i === heroIdx ? 'w-8 bg-white' : 'w-3 bg-white/30'}`} />
-              ))}
+              <div className="flex gap-2 mt-8">
+                {HERO_SLIDES.map((_, i) => (
+                  <button key={i} onClick={() => setHeroIdx(i)}
+                    aria-label={`Show hero slide ${i + 1}`}
+                    aria-current={i === heroIdx ? 'true' : undefined}
+                    className={`h-1.5 rounded-full transition-all duration-300 ${i === heroIdx ? 'w-8 bg-white' : 'w-3 bg-white/30'}`} />
+                ))}
+              </div>
+            </div>
+            <div className="hero-product-stage mx-auto w-full max-w-[440px] min-h-[210px] sm:min-h-[300px] lg:min-h-[390px] pointer-events-none select-none" aria-hidden="true">
+              <div className="hero-product-halo" />
+              <span className="hero-product-bubble hero-product-bubble--top">✦</span>
+              <span className="hero-product-bubble hero-product-bubble--left">✧</span>
+              <span className="hero-product-bubble hero-product-bubble--right">✦</span>
+              <div className="hero-product-float">
+                <div key={HERO_PRODUCTS[heroProductIdx].id} className="hero-product-enter">
+                  <div className="hero-product-card">
+                    <span className="hero-product-illustration">
+                      {HERO_PRODUCTS[heroProductIdx].illustration}
+                    </span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>

@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.db.models import Avg, Q
+from django.db.models import Avg, Q, Sum
 from django.utils import timezone
 
 
@@ -53,7 +53,16 @@ class Product(models.Model):
 
     @property
     def in_stock(self):
-        return self.stock > 0
+        return self.available_stock > 0
+
+    @property
+    def available_stock(self):
+        reserved = OrderItem.objects.filter(
+            product_id=self.pk,
+            order__inventory_reserved=True,
+            order__reservation_expires_at__gt=timezone.now(),
+        ).aggregate(total=Sum('quantity'))['total'] or 0
+        return max(self.stock - reserved, 0)
 
     @property
     def average_rating(self):

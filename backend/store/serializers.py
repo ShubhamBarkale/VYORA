@@ -30,7 +30,8 @@ class ProductSerializer(serializers.ModelSerializer):
         queryset=Category.objects.all(), source='category', write_only=True, required=False
     )
     discounted_price = serializers.ReadOnlyField()
-    in_stock = serializers.ReadOnlyField()
+    stock = serializers.SerializerMethodField()
+    in_stock = serializers.SerializerMethodField()
     average_rating = serializers.SerializerMethodField()
     review_count = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
@@ -71,6 +72,14 @@ class ProductSerializer(serializers.ModelSerializer):
             return obj._review_count
         return obj.review_count
 
+    def get_stock(self, obj):
+        if hasattr(obj, '_reserved_quantity'):
+            return max(obj.stock - (obj._reserved_quantity or 0), 0)
+        return obj.available_stock
+
+    def get_in_stock(self, obj):
+        return self.get_stock(obj) > 0
+
 
 # ── Cart ──────────────────────────────────────────────────────────────────────
 class CartItemSerializer(serializers.ModelSerializer):
@@ -81,7 +90,7 @@ class CartItemSerializer(serializers.ModelSerializer):
     )
     product_image = serializers.SerializerMethodField()
     product_discount_percent = serializers.IntegerField(source='product.discount_percent', read_only=True)
-    product_stock = serializers.IntegerField(source='product.stock', read_only=True)
+    product_stock = serializers.SerializerMethodField()
     subtotal = serializers.ReadOnlyField()
 
     class Meta:
@@ -102,6 +111,11 @@ class CartItemSerializer(serializers.ModelSerializer):
         if obj.product.external_image_url:
             return obj.product.external_image_url
         return None
+
+    def get_product_stock(self, obj):
+        if hasattr(obj.product, '_reserved_quantity'):
+            return max(obj.product.stock - (obj.product._reserved_quantity or 0), 0)
+        return obj.product.available_stock
 
 
 class CartSerializer(serializers.ModelSerializer):

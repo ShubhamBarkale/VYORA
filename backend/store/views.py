@@ -13,7 +13,7 @@ from django.core.mail import send_mail
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import Avg, Count, F, Prefetch, Q, Sum
+from django.db.models import Avg, Count, F, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils import timezone
@@ -73,9 +73,21 @@ class ReviewInputSerializer(serializers.Serializer):
 
 
 def _product_queryset():
+    reserved_quantity = (
+        OrderItem.objects.filter(
+            product_id=OuterRef('pk'),
+            order__inventory_reserved=True,
+            order__reservation_expires_at__gt=timezone.now(),
+        )
+        .order_by()
+        .values('product_id')
+        .annotate(total=Sum('quantity'))
+        .values('total')[:1]
+    )
     return Product.objects.select_related('category').annotate(
         _average_rating=Avg('reviews__rating'),
         _review_count=Count('reviews', distinct=True),
+        _reserved_quantity=Subquery(reserved_quantity, output_field=IntegerField()),
     )
 
 
@@ -229,7 +241,9 @@ def get_related_products(request, pk):
 def get_cart(request):
     User.objects.select_for_update().get(pk=request.user.pk)
     cart, _ = Cart.objects.get_or_create(user=request.user)
-    cart = Cart.objects.prefetch_related('items__product').get(pk=cart.pk)
+    cart = Cart.objects.prefetch_related(
+        Prefetch('items__product', queryset=_product_queryset())
+    ).get(pk=cart.pk)
     serializer = CartSerializer(cart, context={'request': request})
     return Response(serializer.data)
 
@@ -266,7 +280,9 @@ def add_to_cart(request):
     else:
         CartItem.objects.create(cart=cart, product=product, quantity=new_quantity)
 
-    cart = Cart.objects.prefetch_related('items__product').get(pk=cart.pk)
+    cart = Cart.objects.prefetch_related(
+        Prefetch('items__product', queryset=_product_queryset())
+    ).get(pk=cart.pk)
     serializer = CartSerializer(cart, context={'request': request})
     return Response({'message': 'Product added to cart', 'cart': serializer.data})
 
@@ -584,6 +600,10 @@ def create_order(request):
         return Response(validation_error[0], status=validation_error[1])
 
     payment_method = data.get('payment_method', 'COD')
+    if payment_method == 'RAZORPAY':
+        return Response({
+            'error': 'Use the online payment endpoint to create a Razorpay order.'
+        }, status=400)
     cart, cart_items = _locked_cart_items(request.user)
     if not cart_items:
         return Response({'error': 'Your cart is empty'}, status=400)
@@ -615,7 +635,7 @@ def create_order(request):
         shipping_charge=shipping_charge,
         total_amount=total_amount,
         coupon_code=coupon_code,
-        status='pending' if payment_method == 'RAZORPAY' else 'confirmed',
+        status='confirmed',
     )
 
     for item in cart_items:
@@ -643,14 +663,9 @@ def create_order(request):
             'payment_method': order.payment_method,
         }, status=201)
 
-    order.record_status_update('pending', 'Awaiting Razorpay payment confirmation.')
     return Response({
-        'message': 'Order created. Please complete payment.',
-        'order_number': order.order_number,
-        'order_id': order.id,
-        'total_amount': str(order.total_amount),
-        'payment_method': order.payment_method,
-    }, status=201)
+        'error': 'Use the online payment endpoint to create a Razorpay order.'
+    }, status=400)
 
 
 @api_view(['GET'])
@@ -756,6 +771,11 @@ def create_razorpay_order(request):
             price=item.product.discounted_price,
         )
 
+    order.inventory_reserved = True
+    order.reservation_expires_at = timezone.now() + timedelta(
+        minutes=INVENTORY_RESERVATION_MINUTES
+    )
+    order.save(update_fields=['inventory_reserved', 'reservation_expires_at'])
     order.record_status_update('pending', 'Awaiting payment confirmation.')
     amount_paise = int(order.total_amount * 100)
 
@@ -797,7 +817,11 @@ def create_razorpay_order(request):
             )
         order.status = 'cancelled'
         order.payment_status = 'failed'
-        order.save(update_fields=['status', 'payment_status'])
+        order.inventory_reserved = False
+        order.reservation_expires_at = None
+        order.save(update_fields=[
+            'status', 'payment_status', 'inventory_reserved', 'reservation_expires_at',
+        ])
         order.record_status_update('cancelled', 'Payment initialization failed.')
         return Response({'error': 'Payment initialization failed.'}, status=502)
 
@@ -860,6 +884,11 @@ def verify_razorpay_payment(request):
                     'message': 'Payment already verified.',
                     'order_number': order.order_number,
                 })
+            if order.inventory_reserved and (
+                order.reservation_expires_at is None
+                or order.reservation_expires_at <= timezone.now()
+            ):
+                raise ValueError('The payment session expired. Please start checkout again.')
 
             order_items = list(order.items.select_related('product').order_by('product_id'))
             products = Product.objects.select_for_update().filter(
@@ -870,8 +899,9 @@ def verify_razorpay_payment(request):
                 product = product_by_id.get(item.product_id)
                 if product is None or not product.is_active:
                     raise ValueError(f'"{item.product_name}" is no longer available.')
-                if item.quantity > product.stock:
-                    raise ValueError(f'Only {product.stock} units of "{item.product_name}" available')
+                available_stock = _available_stock(product, exclude_order_id=order.pk)
+                if item.quantity > available_stock:
+                    raise ValueError(f'Only {available_stock} units of "{item.product_name}" available')
 
             if not demo_payment:
                 client = razorpay.Client(auth=(
@@ -906,9 +936,12 @@ def verify_razorpay_payment(request):
             order.razorpay_signature = razorpay_signature
             order.payment_status = 'paid'
             order.status = 'confirmed'
+            order.inventory_reserved = False
+            order.reservation_expires_at = None
             order.save(update_fields=[
                 'razorpay_payment_id', 'razorpay_signature',
-                'payment_status', 'status', 'updated_at',
+                'payment_status', 'status', 'inventory_reserved',
+                'reservation_expires_at', 'updated_at',
             ])
             note = (
                 'Demo payment verified. This is a local test order.'

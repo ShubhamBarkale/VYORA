@@ -326,6 +326,40 @@ class BackendIntegrityTests(APITestCase):
         self.assertEqual(self.product.stock, 4)
 
     @override_settings(DEBUG=True, RAZORPAY_KEY_ID='', RAZORPAY_KEY_SECRET='')
+    def test_online_checkout_reserves_stock_until_payment_or_expiry(self):
+        first_response = self.client.post(
+            '/api/payment/create/',
+            {**self.shipping_data, 'payment_method': 'RAZORPAY'},
+            format='json',
+        )
+        self.assertEqual(first_response.status_code, 200)
+        order = Order.objects.get(order_number=first_response.data['order_number'])
+        self.assertTrue(order.inventory_reserved)
+        self.assertGreater(order.reservation_expires_at, timezone.now())
+
+        second_user = User.objects.create_user(username='second-shopper')
+        second_cart = Cart.objects.create(user=second_user)
+        CartItem.objects.create(cart=second_cart, product=self.product, quantity=3)
+        self.client.force_authenticate(user=second_user)
+        blocked_response = self.client.post(
+            '/api/payment/create/',
+            {**self.shipping_data, 'payment_method': 'RAZORPAY'},
+            format='json',
+        )
+        self.assertEqual(blocked_response.status_code, 400)
+        self.assertEqual(Order.objects.count(), 1)
+
+        Order.objects.filter(pk=order.pk).update(
+            reservation_expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        expired_reservation_response = self.client.post(
+            '/api/payment/create/',
+            {**self.shipping_data, 'payment_method': 'RAZORPAY'},
+            format='json',
+        )
+        self.assertEqual(expired_reservation_response.status_code, 200)
+
+    @override_settings(DEBUG=True, RAZORPAY_KEY_ID='', RAZORPAY_KEY_SECRET='')
     def test_debug_demo_payment_finalizes_the_matching_order_once(self):
         order = Order.objects.create(
             user=self.user,
