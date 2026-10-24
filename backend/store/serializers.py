@@ -1,4 +1,6 @@
 from rest_framework import serializers
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import (
     Product, Category, Cart, CartItem,
     UserProfile, Address, Order, OrderStatusUpdate, OrderItem,
@@ -16,6 +18,8 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'slug', 'icon', 'description', 'product_count']
 
     def get_product_count(self, obj):
+        if hasattr(obj, '_product_count'):
+            return obj._product_count
         return obj.products.filter(is_active=True).count()
 
 
@@ -27,8 +31,8 @@ class ProductSerializer(serializers.ModelSerializer):
     )
     discounted_price = serializers.ReadOnlyField()
     in_stock = serializers.ReadOnlyField()
-    average_rating = serializers.ReadOnlyField()
-    review_count = serializers.ReadOnlyField()
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -56,6 +60,16 @@ class ProductSerializer(serializers.ModelSerializer):
         if obj.external_image_url:
             return obj.external_image_url   # return as-is — already a full URL
         return None
+
+    def get_average_rating(self, obj):
+        if hasattr(obj, '_average_rating'):
+            return obj._average_rating or 0
+        return obj.average_rating
+
+    def get_review_count(self, obj):
+        if hasattr(obj, '_review_count'):
+            return obj._review_count
+        return obj.review_count
 
 
 # ── Cart ──────────────────────────────────────────────────────────────────────
@@ -151,7 +165,7 @@ class RegisterSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=150, required=False, default='')
     last_name = serializers.CharField(max_length=150, required=False, default='')
     phone = serializers.CharField(max_length=15, required=False, default='')
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(write_only=True, min_length=8)
     password2 = serializers.CharField(write_only=True)
 
     def validate_username(self, value):
@@ -167,6 +181,16 @@ class RegisterSerializer(serializers.Serializer):
     def validate(self, data):
         if data['password'] != data['password2']:
             raise serializers.ValidationError({"password": "Passwords do not match."})
+        user = User(
+            username=data['username'],
+            email=data['email'],
+            first_name=data.get('first_name', ''),
+            last_name=data.get('last_name', ''),
+        )
+        try:
+            validate_password(data['password'], user=user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': exc.messages})
         return data
 
     def create(self, validated_data):
@@ -192,12 +216,16 @@ class UpdateProfileSerializer(serializers.Serializer):
 
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(write_only=True)
-    new_password = serializers.CharField(write_only=True, min_length=6)
+    new_password = serializers.CharField(write_only=True, min_length=8)
     new_password2 = serializers.CharField(write_only=True)
 
     def validate(self, data):
         if data['new_password'] != data['new_password2']:
             raise serializers.ValidationError({"new_password": "New passwords do not match."})
+        try:
+            validate_password(data['new_password'], user=self.context.get('user'))
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'new_password': exc.messages})
         return data
 
 

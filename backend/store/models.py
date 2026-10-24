@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.db.models import Avg
+from django.db.models import Avg, Q
 from django.utils import timezone
 
 
@@ -36,6 +36,10 @@ class Product(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [
+            models.CheckConstraint(condition=Q(price__gte=0), name='product_price_nonnegative'),
+            models.CheckConstraint(condition=Q(discount_percent__lte=100), name='product_discount_at_most_100'),
+        ]
 
     def __str__(self):
         return self.name
@@ -80,6 +84,15 @@ class Address(models.Model):
     postal_code = models.CharField(max_length=10)
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=Q(user__isnull=False),
+                name='unique_user_cart',
+            ),
+        ]
 
     class Meta:
         verbose_name_plural = 'Addresses'
@@ -127,6 +140,8 @@ class Order(models.Model):
     razorpay_order_id = models.CharField(max_length=100, blank=True)
     razorpay_payment_id = models.CharField(max_length=100, blank=True)
     razorpay_signature = models.CharField(max_length=200, blank=True)
+    inventory_reserved = models.BooleanField(default=False)
+    reservation_expires_at = models.DateTimeField(null=True, blank=True)
     # Financials
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -201,6 +216,12 @@ class OrderItem(models.Model):
     quantity = models.PositiveIntegerField(default=1)
     price = models.DecimalField(max_digits=10, decimal_places=2)  # price at time of order
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(quantity__gte=1), name='order_item_quantity_at_least_one'),
+            models.CheckConstraint(condition=Q(price__gte=0), name='order_item_price_nonnegative'),
+        ]
+
     def __str__(self):
         return f"{self.quantity} x {self.product_name}"
 
@@ -212,6 +233,15 @@ class OrderItem(models.Model):
 class Cart(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=Q(user__isnull=False),
+                name='unique_user_cart',
+            ),
+        ]
 
     def __str__(self):
         return f"Cart {self.id} for {self.user}"
@@ -229,6 +259,12 @@ class CartItem(models.Model):
     cart = models.ForeignKey(Cart, related_name='items', on_delete=models.CASCADE)
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     quantity = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['cart', 'product'], name='unique_product_per_cart'),
+            models.CheckConstraint(condition=Q(quantity__gte=1), name='cart_item_quantity_at_least_one'),
+        ]
 
     @property
     def subtotal(self):
@@ -259,6 +295,12 @@ class Review(models.Model):
     class Meta:
         unique_together = ('product', 'user')   # one review per user per product
         ordering = ['-created_at']
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(rating__gte=1) & Q(rating__lte=5),
+                name='review_rating_between_1_and_5',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.user.username} → {self.product.name} ({self.rating}★)"
@@ -282,6 +324,20 @@ class Coupon(models.Model):
     usage_limit = models.PositiveIntegerField(default=0, help_text='0 = unlimited')
     used_count = models.PositiveIntegerField(default=0)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(discount_value__gte=0)
+                & (Q(discount_type='fixed') | Q(discount_value__lte=100)),
+                name='coupon_discount_value_valid',
+            ),
+            models.CheckConstraint(condition=Q(min_order_amount__gte=0), name='coupon_min_order_nonnegative'),
+            models.CheckConstraint(
+                condition=Q(max_discount_amount__isnull=True) | Q(max_discount_amount__gte=0),
+                name='coupon_max_discount_nonnegative',
+            ),
+        ]
+
     def __str__(self):
         return self.code
 
@@ -303,7 +359,7 @@ class Coupon(models.Model):
             return 0
         if self.discount_type == 'percentage':
             discount = order_total * self.discount_value / 100
-            if self.max_discount_amount:
+            if self.max_discount_amount is not None:
                 discount = min(discount, self.max_discount_amount)
             return round(discount, 2)
         else:

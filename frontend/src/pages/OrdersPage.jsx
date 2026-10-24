@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Package, ShoppingBag, ChevronRight } from 'lucide-react';
+import { Package, ShoppingBag, ChevronLeft, ChevronRight } from 'lucide-react';
 import { authFetch } from '../utils/auth';
 
 const BASE = import.meta.env.VITE_DJANGO_BASE_URL;
@@ -9,14 +9,39 @@ const S = { pending:'bg-amber-50 text-amber-700 border-amber-200', confirmed:'bg
 export default function OrdersPage() {
   const [orders,  setOrders]  = useState([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    authFetch(`${BASE}/api/orders/`).then(r=>r.ok?r.json():[]).then(d=>setOrders(Array.isArray(d)?d:[])).catch(()=>[]).finally(()=>setLoading(false));
-  }, []);
+    let active = true;
+    setLoading(true);
+    authFetch(`${BASE}/api/orders/?page=${page}`)
+      .then(async response => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Unable to load orders.');
+        if (active) {
+          setOrders(data.results);
+          setTotalPages(data.total_pages);
+          setError('');
+        }
+      })
+      .catch(reason => {
+        if (active) setError(reason.message || 'Unable to load orders.');
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [page]);
 
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center" style={{ background:'var(--vyora-bg)' }}>
       <div className="w-10 h-10 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
+    </div>
+  );
+
+  if (error) return (
+    <div className="min-h-screen flex items-center justify-center px-4" style={{ background:'var(--vyora-bg)', color:'var(--vyora-text)' }}>
+      <p role="alert">{error}</p>
     </div>
   );
 
@@ -80,6 +105,27 @@ export default function OrdersPage() {
             </Link>
           ))}
         </div>
+        {totalPages > 1 && (
+          <nav aria-label="Order pages" className="mt-6 flex items-center justify-center gap-4">
+            <button
+              type="button"
+              onClick={() => setPage(value => Math.max(1, value - 1))}
+              disabled={page === 1}
+              className="btn-secondary px-3 py-2 disabled:opacity-50"
+            >
+              <ChevronLeft size={18} />
+            </button>
+            <span style={{ color:'var(--vyora-muted)' }}>Page {page} of {totalPages}</span>
+            <button
+              type="button"
+              onClick={() => setPage(value => Math.min(totalPages, value + 1))}
+              disabled={page === totalPages}
+              className="btn-secondary px-3 py-2 disabled:opacity-50"
+            >
+              <ChevronRight size={18} />
+            </button>
+          </nav>
+        )}
       </div>
     </div>
   );

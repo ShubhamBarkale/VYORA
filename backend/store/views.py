@@ -1,21 +1,27 @@
 import hmac
 import hashlib
+import logging
 import re
+from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 
 import razorpay
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Avg, Count, F, Prefetch, Q, Sum
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils import timezone
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import serializers, status
 
 from .models import (
     Product, Category, Cart, CartItem,
@@ -34,8 +40,65 @@ from .serializers import (
 from .ai_assistant import build_assistant_result
 
 
+logger = logging.getLogger(__name__)
+INVENTORY_RESERVATION_MINUTES = 15
+
+
 def _is_demo_payment_mode():
-    return not bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET)
+    return settings.DEBUG and not bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET)
+
+
+class CartAddSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1, max_value=1000, default=1)
+
+
+class CartQuantitySerializer(serializers.Serializer):
+    item_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=0, max_value=1000)
+
+
+class ProductIdSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+
+
+class CartItemIdSerializer(serializers.Serializer):
+    item_id = serializers.IntegerField(min_value=1)
+
+
+class ReviewInputSerializer(serializers.Serializer):
+    rating = serializers.IntegerField(min_value=1, max_value=5, default=5)
+    title = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
+    comment = serializers.CharField(max_length=2000, required=False, allow_blank=True, default='')
+
+
+def _product_queryset():
+    return Product.objects.select_related('category').annotate(
+        _average_rating=Avg('reviews__rating'),
+        _review_count=Count('reviews', distinct=True),
+    )
+
+
+def _positive_price(value, field_name):
+    try:
+        price = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(f'{field_name} must be a valid amount.')
+    if not price.is_finite() or price < 0:
+        raise ValueError(f'{field_name} must be a non-negative amount.')
+    return price
+
+
+def _available_stock(product, exclude_order_id=None):
+    reservations = OrderItem.objects.filter(
+        product_id=product.pk,
+        order__inventory_reserved=True,
+        order__reservation_expires_at__gt=timezone.now(),
+    )
+    if exclude_order_id is not None:
+        reservations = reservations.exclude(order_id=exclude_order_id)
+    reserved_quantity = reservations.aggregate(total=Sum('quantity'))['total'] or 0
+    return max(product.stock - reserved_quantity, 0)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -44,7 +107,7 @@ def _is_demo_payment_mode():
 
 @api_view(['GET'])
 def get_products(request):
-    qs = Product.objects.filter(is_active=True).select_related('category')
+    qs = _product_queryset().filter(is_active=True)
 
     # Search
     search = request.query_params.get('search', '').strip()
@@ -69,9 +132,19 @@ def get_products(request):
     min_price = request.query_params.get('min_price', '').strip()
     max_price = request.query_params.get('max_price', '').strip()
     if min_price:
+        try:
+            min_price = _positive_price(min_price, 'min_price')
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
         qs = qs.filter(price__gte=min_price)
     if max_price:
+        try:
+            max_price = _positive_price(max_price, 'max_price')
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
         qs = qs.filter(price__lte=max_price)
+    if min_price and max_price and min_price > max_price:
+        return Response({'error': 'min_price cannot be greater than max_price.'}, status=400)
 
     # Sorting
     sort = request.query_params.get('sort', '').strip()
@@ -87,8 +160,13 @@ def get_products(request):
         qs = qs.order_by('-created_at')
 
     # Pagination
-    page_size = 20
-    page = int(request.query_params.get('page', 1))
+    try:
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+    except (TypeError, ValueError):
+        return Response({'error': 'page and page_size must be integers.'}, status=400)
+    if page < 1 or page_size < 1 or page_size > 100:
+        return Response({'error': 'page must be positive and page_size must be between 1 and 100.'}, status=400)
     total = qs.count()
     start = (page - 1) * page_size
     products = qs[start: start + page_size]
@@ -105,7 +183,7 @@ def get_products(request):
 @api_view(['GET'])
 def get_product(request, pk):
     try:
-        product = Product.objects.select_related('category').prefetch_related('reviews__user').get(id=pk, is_active=True)
+        product = _product_queryset().prefetch_related('reviews__user').get(id=pk, is_active=True)
         serializer = ProductSerializer(product, context={'request': request})
         return Response(serializer.data)
     except Product.DoesNotExist:
@@ -114,14 +192,16 @@ def get_product(request, pk):
 
 @api_view(['GET'])
 def get_categories(request):
-    categories = Category.objects.all()
+    categories = Category.objects.annotate(
+        _product_count=Count('products', filter=Q(products__is_active=True), distinct=True)
+    )
     serializer = CategorySerializer(categories, many=True)
     return Response(serializer.data)
 
 
 @api_view(['GET'])
 def get_featured_products(request):
-    products = Product.objects.filter(is_active=True, is_featured=True).select_related('category')[:8]
+    products = _product_queryset().filter(is_active=True, is_featured=True)[:8]
     serializer = ProductSerializer(products, many=True, context={'request': request})
     return Response(serializer.data)
 
@@ -130,9 +210,9 @@ def get_featured_products(request):
 def get_related_products(request, pk):
     try:
         product = Product.objects.get(id=pk)
-        related = Product.objects.filter(
+        related = _product_queryset().filter(
             category=product.category, is_active=True
-        ).exclude(id=pk).select_related('category')[:6]
+        ).exclude(id=pk)[:6]
         serializer = ProductSerializer(related, many=True, context={'request': request})
         return Response(serializer.data)
     except Product.DoesNotExist:
@@ -145,71 +225,91 @@ def get_related_products(request, pk):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def get_cart(request):
+    User.objects.select_for_update().get(pk=request.user.pk)
     cart, _ = Cart.objects.get_or_create(user=request.user)
+    cart = Cart.objects.prefetch_related('items__product').get(pk=cart.pk)
     serializer = CartSerializer(cart, context={'request': request})
     return Response(serializer.data)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def add_to_cart(request):
-    product_id = request.data.get('product_id')
-    quantity = int(request.data.get('quantity', 1))
+    input_serializer = CartAddSerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
+    product_id = input_serializer.validated_data['product_id']
+    quantity = input_serializer.validated_data['quantity']
+    User.objects.select_for_update().get(pk=request.user.pk)
     try:
-        product = Product.objects.get(id=product_id, is_active=True)
+        product = Product.objects.select_for_update().get(id=product_id, is_active=True)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found'}, status=404)
 
-    if product.stock < 1:
+    available_stock = _available_stock(product)
+    if available_stock < 1:
         return Response({'error': 'Product is out of stock'}, status=400)
 
     cart, _ = Cart.objects.get_or_create(user=request.user)
-    item, created = CartItem.objects.get_or_create(cart=cart, product=product)
-    if not created:
-        new_qty = item.quantity + quantity
-        if new_qty > product.stock:
-            return Response({'error': f'Only {product.stock} units available'}, status=400)
-        item.quantity = new_qty
-        item.save()
+    item = CartItem.objects.select_for_update().filter(cart=cart, product=product).first()
+    new_quantity = quantity + (item.quantity if item else 0)
+    if new_quantity > available_stock:
+        return Response({'error': f'Only {available_stock} units available'}, status=400)
+    if new_quantity > 1000:
+        return Response({'error': 'Cart quantity cannot exceed 1000 units.'}, status=400)
+    if item:
+        item.quantity = new_quantity
+        item.save(update_fields=['quantity'])
     else:
-        if quantity > product.stock:
-            return Response({'error': f'Only {product.stock} units available'}, status=400)
-        item.quantity = quantity
-        item.save()
+        CartItem.objects.create(cart=cart, product=product, quantity=new_quantity)
 
+    cart = Cart.objects.prefetch_related('items__product').get(pk=cart.pk)
     serializer = CartSerializer(cart, context={'request': request})
     return Response({'message': 'Product added to cart', 'cart': serializer.data})
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def update_cart_quantity(request):
-    item_id = request.data.get('item_id')
-    quantity = request.data.get('quantity')
-    if not item_id or quantity is None:
-        return Response({'error': 'Item ID and quantity are required'}, status=400)
+    input_serializer = CartQuantitySerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
+    item_id = input_serializer.validated_data['item_id']
+    quantity = input_serializer.validated_data['quantity']
+    User.objects.select_for_update().get(pk=request.user.pk)
     try:
-        item = CartItem.objects.select_related('cart', 'product').get(id=item_id, cart__user=request.user)
+        item = CartItem.objects.select_for_update().get(id=item_id, cart__user=request.user)
     except CartItem.DoesNotExist:
         return Response({'error': 'Cart item not found'}, status=404)
+    product = Product.objects.select_for_update().get(pk=item.product_id)
 
-    if int(quantity) < 1:
+    if quantity < 1:
         item.delete()
         return Response({'message': 'Item removed'})
 
-    if int(quantity) > item.product.stock:
-        return Response({'error': f'Only {item.product.stock} units available'}, status=400)
+    available_stock = _available_stock(product)
+    if quantity > available_stock:
+        return Response({'error': f'Only {available_stock} units available'}, status=400)
 
-    item.quantity = int(quantity)
+    item.quantity = quantity
     item.save()
+    item.product = product
     return Response(CartItemSerializer(item, context={'request': request}).data)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def remove_from_cart(request):
-    item_id = request.data.get('item_id')
+    input_serializer = CartItemIdSerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
+    User.objects.select_for_update().get(pk=request.user.pk)
+    item_id = input_serializer.validated_data['item_id']
     CartItem.objects.filter(id=item_id, cart__user=request.user).delete()
     return Response({'message': 'Item removed from cart'})
 
@@ -220,18 +320,28 @@ def remove_from_cart(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def get_wishlist(request):
+    User.objects.select_for_update().get(pk=request.user.pk)
     wishlist, _ = Wishlist.objects.get_or_create(user=request.user)
+    wishlist = Wishlist.objects.prefetch_related(
+        Prefetch('products', queryset=_product_queryset())
+    ).get(pk=wishlist.pk)
     serializer = WishlistSerializer(wishlist, context={'request': request})
     return Response(serializer.data)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def toggle_wishlist(request):
-    product_id = request.data.get('product_id')
+    input_serializer = ProductIdSerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
+    User.objects.select_for_update().get(pk=request.user.pk)
+    product_id = input_serializer.validated_data['product_id']
     try:
-        product = Product.objects.get(id=product_id)
+        product = Product.objects.select_for_update().get(id=product_id)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found'}, status=404)
 
@@ -246,25 +356,36 @@ def toggle_wishlist(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def move_to_cart(request):
     """Move a wishlist product into the cart."""
-    product_id = request.data.get('product_id')
+    input_serializer = ProductIdSerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
+    User.objects.select_for_update().get(pk=request.user.pk)
+    product_id = input_serializer.validated_data['product_id']
     try:
-        product = Product.objects.get(id=product_id)
+        product = Product.objects.select_for_update().get(id=product_id, is_active=True)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found'}, status=404)
 
-    if product.stock < 1:
+    available_stock = _available_stock(product)
+    if available_stock < 1:
         return Response({'error': 'Product is out of stock'}, status=400)
 
     wishlist, _ = Wishlist.objects.get_or_create(user=request.user)
     wishlist.products.remove(product)
 
     cart, _ = Cart.objects.get_or_create(user=request.user)
-    item, created = CartItem.objects.get_or_create(cart=cart, product=product)
-    if not created:
-        item.quantity += 1
-        item.save()
+    item = CartItem.objects.select_for_update().filter(cart=cart, product=product).first()
+    new_quantity = item.quantity + 1 if item else 1
+    if new_quantity > available_stock:
+        return Response({'error': f'Only {available_stock} units available'}, status=400)
+    if item:
+        item.quantity = new_quantity
+        item.save(update_fields=['quantity'])
+    else:
+        CartItem.objects.create(cart=cart, product=product, quantity=1)
 
     return Response({'message': 'Moved to cart'})
 
@@ -275,11 +396,13 @@ def move_to_cart(request):
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def address_list(request):
     if request.method == 'GET':
         addresses = Address.objects.filter(user=request.user)
         return Response(AddressSerializer(addresses, many=True).data)
 
+    User.objects.select_for_update().get(pk=request.user.pk)
     serializer = AddressSerializer(data=request.data)
     if serializer.is_valid():
         # If this is set as default, unset others
@@ -292,9 +415,11 @@ def address_list(request):
 
 @api_view(['PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def address_detail(request, pk):
+    User.objects.select_for_update().get(pk=request.user.pk)
     try:
-        address = Address.objects.get(id=pk, user=request.user)
+        address = Address.objects.select_for_update().get(id=pk, user=request.user)
     except Address.DoesNotExist:
         return Response({'error': 'Address not found'}, status=404)
 
@@ -352,16 +477,31 @@ def _send_order_confirmation(order):
 def _validate_shipping_data(data):
     required = ['shipping_name', 'shipping_phone', 'shipping_address', 'shipping_city', 'shipping_state', 'shipping_postal_code']
     for field in required:
-        if not data.get(field, '').strip():
+        value = data.get(field, '')
+        if not isinstance(value, str) or not value.strip():
             return {'error': f'{field} is required'}, 400
 
-    phone = data.get('shipping_phone', '')
-    if not phone.isdigit() or len(phone) < 10:
-        return {'error': 'Invalid phone number (must be 10+ digits)'}, 400
+    max_lengths = {
+        'shipping_name': 100,
+        'shipping_phone': 15,
+        'shipping_city': 100,
+        'shipping_state': 100,
+        'shipping_postal_code': 10,
+    }
+    for field, max_length in max_lengths.items():
+        if len(data[field].strip()) > max_length:
+            return {'error': f'{field} must be {max_length} characters or fewer.'}, 400
+
+    phone = data['shipping_phone'].strip()
+    if not phone.isdigit() or not 10 <= len(phone) <= 15:
+        return {'error': 'Invalid phone number (must be 10-15 digits)'}, 400
 
     payment_method = data.get('payment_method', 'COD')
     if payment_method not in ['COD', 'RAZORPAY']:
         return {'error': 'Invalid payment method'}, 400
+    coupon_code = data.get('coupon_code', '')
+    if not isinstance(coupon_code, str) or len(coupon_code) > 30:
+        return {'error': 'Invalid coupon code.'}, 400
     return None, None
 
 
@@ -372,7 +512,7 @@ def _calculate_order_totals(cart_items, coupon_code):
 
     if coupon_code:
         try:
-            coupon = Coupon.objects.get(code=coupon_code)
+            coupon = Coupon.objects.select_for_update().get(code=coupon_code)
         except Coupon.DoesNotExist:
             raise ValueError('Invalid coupon code')
 
@@ -389,6 +529,51 @@ def _calculate_order_totals(cart_items, coupon_code):
     return subtotal, shipping_charge, discount_amount, total_amount
 
 
+def _locked_cart_items(user):
+    User.objects.select_for_update().get(pk=user.pk)
+    cart = Cart.objects.select_for_update().filter(user=user).order_by('pk').first()
+    if cart is None:
+        cart = Cart.objects.create(user=user)
+    items = list(
+        CartItem.objects.select_for_update()
+        .filter(cart=cart)
+        .select_related('product')
+        .order_by('product_id')
+    )
+    if not items:
+        return cart, items
+
+    products = Product.objects.select_for_update().filter(
+        pk__in=[item.product_id for item in items]
+    ).order_by('pk')
+    product_by_id = {product.pk: product for product in products}
+    for item in items:
+        item.product = product_by_id[item.product_id]
+    return cart, items
+
+
+def _validate_locked_stock(cart_items, exclude_order_id=None):
+    for item in cart_items:
+        if not item.product.is_active:
+            return f'"{item.product.name}" is no longer available.'
+        available_stock = _available_stock(item.product, exclude_order_id)
+        if item.quantity > available_stock:
+            return f'Only {available_stock} units of "{item.product.name}" available'
+    return None
+
+
+def _remove_ordered_cart_items(user, order_items):
+    cart = Cart.objects.filter(user=user).order_by('pk').first()
+    if cart is None:
+        return
+    for order_item in order_items:
+        CartItem.objects.filter(
+            cart=cart,
+            product_id=order_item.product_id,
+            quantity=order_item.quantity,
+        ).delete()
+
+
 @transaction.atomic
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -399,38 +584,37 @@ def create_order(request):
         return Response(validation_error[0], status=validation_error[1])
 
     payment_method = data.get('payment_method', 'COD')
-    cart, _ = Cart.objects.get_or_create(user=request.user)
-    cart_items = list(cart.items.select_related('product').all())
+    cart, cart_items = _locked_cart_items(request.user)
     if not cart_items:
         return Response({'error': 'Your cart is empty'}, status=400)
+    stock_error = _validate_locked_stock(cart_items)
+    if stock_error:
+        return Response({'error': stock_error}, status=400)
 
+    coupon_code = data.get('coupon_code', '').strip().upper()
     try:
         subtotal, shipping_charge, discount_amount, total_amount = _calculate_order_totals(
             cart_items,
-            data.get('coupon_code', '').strip().upper(),
+            coupon_code,
         )
     except ValueError as exc:
         return Response({'error': str(exc)}, status=400)
 
-    for item in cart_items:
-        if item.quantity > item.product.stock:
-            return Response({'error': f'Only {item.product.stock} units of "{item.product.name}" available'}, status=400)
-
     order = Order.objects.create(
         user=request.user,
-        shipping_name=data['shipping_name'],
-        shipping_phone=data['shipping_phone'],
-        shipping_address=data['shipping_address'],
-        shipping_city=data['shipping_city'],
-        shipping_state=data['shipping_state'],
-        shipping_postal_code=data['shipping_postal_code'],
+        shipping_name=data['shipping_name'].strip(),
+        shipping_phone=data['shipping_phone'].strip(),
+        shipping_address=data['shipping_address'].strip(),
+        shipping_city=data['shipping_city'].strip(),
+        shipping_state=data['shipping_state'].strip(),
+        shipping_postal_code=data['shipping_postal_code'].strip(),
         payment_method=payment_method,
         payment_status='pending',
         subtotal=subtotal,
         discount_amount=discount_amount,
         shipping_charge=shipping_charge,
         total_amount=total_amount,
-        coupon_code=data.get('coupon_code', '').strip().upper(),
+        coupon_code=coupon_code,
         status='pending' if payment_method == 'RAZORPAY' else 'confirmed',
     )
 
@@ -448,8 +632,6 @@ def create_order(request):
         for item in cart_items:
             item.product.stock -= item.quantity
             item.product.save(update_fields=['stock'])
-        order.payment_status = 'paid'
-        order.save(update_fields=['payment_status'])
         order.record_status_update('confirmed', 'Cash on delivery order confirmed.')
         cart.items.all().delete()
         _send_order_confirmation(order)
@@ -475,8 +657,23 @@ def create_order(request):
 @permission_classes([IsAuthenticated])
 def get_my_orders(request):
     orders = Order.objects.filter(user=request.user).prefetch_related('items', 'status_history')
+    try:
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+    except (TypeError, ValueError):
+        return Response({'error': 'page and page_size must be integers.'}, status=400)
+    if page < 1 or not 1 <= page_size <= 100:
+        return Response({'error': 'page must be positive and page_size must be between 1 and 100.'}, status=400)
+    total = orders.count()
+    total_pages = (total + page_size - 1) // page_size
+    orders = orders[(page - 1) * page_size:page * page_size]
     serializer = OrderSerializer(orders, many=True)
-    return Response(serializer.data)
+    return Response({
+        'results': serializer.data,
+        'count': total,
+        'page': page,
+        'total_pages': total_pages,
+    })
 
 
 @api_view(['GET'])
@@ -496,6 +693,7 @@ def get_order_detail(request, order_number):
 # RAZORPAY PAYMENT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@transaction.atomic
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_razorpay_order(request):
@@ -509,38 +707,42 @@ def create_razorpay_order(request):
     if validation_error[0] is not None:
         return Response(validation_error[0], status=validation_error[1])
 
-    cart, _ = Cart.objects.get_or_create(user=request.user)
-    cart_items = list(cart.items.select_related('product').all())
+    if not _is_demo_payment_mode() and not (
+        settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET
+    ):
+        return Response({'error': 'Online payments are not configured.'}, status=503)
+
+    cart, cart_items = _locked_cart_items(request.user)
     if not cart_items:
         return Response({'error': 'Your cart is empty'}, status=400)
+    stock_error = _validate_locked_stock(cart_items)
+    if stock_error:
+        return Response({'error': stock_error}, status=400)
 
+    coupon_code = data.get('coupon_code', '').strip().upper()
     try:
         subtotal, shipping_charge, discount_amount, total_amount = _calculate_order_totals(
             cart_items,
-            data.get('coupon_code', '').strip().upper(),
+            coupon_code,
         )
     except ValueError as exc:
         return Response({'error': str(exc)}, status=400)
 
-    for item in cart_items:
-        if item.quantity > item.product.stock:
-            return Response({'error': f'Only {item.product.stock} units of "{item.product.name}" available'}, status=400)
-
     order = Order.objects.create(
         user=request.user,
-        shipping_name=data['shipping_name'],
-        shipping_phone=data['shipping_phone'],
-        shipping_address=data['shipping_address'],
-        shipping_city=data['shipping_city'],
-        shipping_state=data['shipping_state'],
-        shipping_postal_code=data['shipping_postal_code'],
+        shipping_name=data['shipping_name'].strip(),
+        shipping_phone=data['shipping_phone'].strip(),
+        shipping_address=data['shipping_address'].strip(),
+        shipping_city=data['shipping_city'].strip(),
+        shipping_state=data['shipping_state'].strip(),
+        shipping_postal_code=data['shipping_postal_code'].strip(),
         payment_method='RAZORPAY',
         payment_status='pending',
         subtotal=subtotal,
         discount_amount=discount_amount,
         shipping_charge=shipping_charge,
         total_amount=total_amount,
-        coupon_code=data.get('coupon_code', '').strip().upper(),
+        coupon_code=coupon_code,
         status='pending',
     )
 
@@ -555,7 +757,7 @@ def create_razorpay_order(request):
         )
 
     order.record_status_update('pending', 'Awaiting payment confirmation.')
-    amount_paise = int(float(order.total_amount) * 100)
+    amount_paise = int(order.total_amount * 100)
 
     if _is_demo_payment_mode():
         order.razorpay_order_id = f'demo_{order.order_number}'
@@ -587,112 +789,149 @@ def create_razorpay_order(request):
             'order_number': order.order_number,
             'key_id': settings.RAZORPAY_KEY_ID,
         })
-    except Exception as e:
+    except Exception:
+        logger.exception('Razorpay order initialization failed for order %s', order.order_number)
+        if coupon_code:
+            Coupon.objects.filter(code=coupon_code, used_count__gt=0).update(
+                used_count=F('used_count') - 1
+            )
         order.status = 'cancelled'
         order.payment_status = 'failed'
         order.save(update_fields=['status', 'payment_status'])
         order.record_status_update('cancelled', 'Payment initialization failed.')
-        return Response({'error': str(e)}, status=500)
+        return Response({'error': 'Payment initialization failed.'}, status=502)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def verify_razorpay_payment(request):
-    """Step 2: Verify the payment signature on the backend and finalize stock.
-
-    Demo mode explicitly confirms the transaction only when the frontend sends the
-    demo flag. This prevents unpaid orders from being marked as paid.
-    """
+    """Verify payment with Razorpay, then atomically finalize inventory and order state."""
     razorpay_order_id = request.data.get('razorpay_order_id', '')
     razorpay_payment_id = request.data.get('razorpay_payment_id', '')
     razorpay_signature = request.data.get('razorpay_signature', '')
-    demo_mode = request.data.get('demo', False) or request.data.get('demo_mode', False)
+    if not all(
+        isinstance(value, str) and value and len(value) <= max_length
+        for value, max_length in (
+            (razorpay_order_id, 100),
+            (razorpay_payment_id, 100),
+            (razorpay_signature, 200),
+        )
+    ):
+        return Response({'error': 'Payment verification data is invalid.'}, status=400)
 
     try:
-        order = Order.objects.prefetch_related('items__product').get(razorpay_order_id=razorpay_order_id, user=request.user)
+        order = Order.objects.get(razorpay_order_id=razorpay_order_id, user=request.user)
     except Order.DoesNotExist:
         return Response({'error': 'Order not found'}, status=404)
 
+    if order.payment_method != 'RAZORPAY':
+        return Response({'error': 'This order is not payable with Razorpay.'}, status=400)
     if order.payment_status == 'paid':
         return Response({'message': 'Payment already verified.', 'order_number': order.order_number})
+    if order.status == 'cancelled':
+        return Response({'error': 'This order can no longer be paid.'}, status=400)
 
-    if _is_demo_payment_mode() or demo_mode:
-        try:
-            with transaction.atomic():
-                for item in order.items.select_related('product'):
-                    if item.quantity > item.product.stock:
-                        raise ValueError(f'Only {item.product.stock} units of "{item.product.name}" available')
-                    item.product.stock -= item.quantity
-                    item.product.save(update_fields=['stock'])
-
-                order.razorpay_payment_id = razorpay_payment_id or f'demo_{order.order_number}'
-                order.razorpay_signature = razorpay_signature or 'demo_signature'
-                order.payment_status = 'paid'
-                order.status = 'confirmed'
-                order.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'payment_status', 'status'])
-                order.record_status_update('confirmed', 'Demo payment verified. This is a local test order.')
-
-            cart = Cart.objects.filter(user=request.user).first()
-            if cart:
-                cart.items.all().delete()
-
-            _send_order_confirmation(order)
-            return Response({
-                'message': 'Demo payment verified. Order confirmed!',
-                'order_number': order.order_number,
-                'demo_mode': True,
-            })
-        except ValueError as exc:
-            order.payment_status = 'failed'
-            order.status = 'cancelled'
-            order.save(update_fields=['payment_status', 'status'])
-            order.record_status_update('cancelled', f'Order could not be finalized: {exc}')
-            return Response({'error': str(exc)}, status=400)
-
-    msg = f"{razorpay_order_id}|{razorpay_payment_id}"
-    generated_sig = hmac.new(
-        key=settings.RAZORPAY_KEY_SECRET.encode(),
-        msg=msg.encode(),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-
-    if generated_sig != razorpay_signature:
-        order.payment_status = 'failed'
-        order.status = 'cancelled'
-        order.save(update_fields=['payment_status', 'status'])
-        order.record_status_update('cancelled', 'Payment verification failed.')
-        return Response({'error': 'Payment verification failed'}, status=400)
+    demo_payment = _is_demo_payment_mode()
+    if demo_payment:
+        if (
+            razorpay_order_id != f'demo_{order.order_number}'
+            or not razorpay_payment_id.startswith('demo_')
+            or not razorpay_signature.startswith('demo_signature_')
+        ):
+            return Response({'error': 'Payment verification failed.'}, status=400)
+    else:
+        if not (settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET):
+            return Response({'error': 'Online payments are not configured.'}, status=503)
+        message = f'{razorpay_order_id}|{razorpay_payment_id}'
+        generated_signature = hmac.new(
+            settings.RAZORPAY_KEY_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(generated_signature, razorpay_signature):
+            return Response({'error': 'Payment verification failed.'}, status=400)
 
     try:
         with transaction.atomic():
-            for item in order.items.select_related('product'):
-                if item.quantity > item.product.stock:
-                    raise ValueError(f'Only {item.product.stock} units of "{item.product.name}" available')
-                item.product.stock -= item.quantity
-                item.product.save(update_fields=['stock'])
+            User.objects.select_for_update().get(pk=request.user.pk)
+            order = Order.objects.select_for_update().get(pk=order.pk, user=request.user)
+            if order.payment_status == 'paid':
+                return Response({
+                    'message': 'Payment already verified.',
+                    'order_number': order.order_number,
+                })
+
+            order_items = list(order.items.select_related('product').order_by('product_id'))
+            products = Product.objects.select_for_update().filter(
+                pk__in=[item.product_id for item in order_items if item.product_id]
+            ).order_by('pk')
+            product_by_id = {product.pk: product for product in products}
+            for item in order_items:
+                product = product_by_id.get(item.product_id)
+                if product is None or not product.is_active:
+                    raise ValueError(f'"{item.product_name}" is no longer available.')
+                if item.quantity > product.stock:
+                    raise ValueError(f'Only {product.stock} units of "{item.product_name}" available')
+
+            if not demo_payment:
+                client = razorpay.Client(auth=(
+                    settings.RAZORPAY_KEY_ID,
+                    settings.RAZORPAY_KEY_SECRET,
+                ))
+                payment = client.payment.fetch(razorpay_payment_id)
+                expected_amount = int(order.total_amount * 100)
+                if (
+                    payment.get('order_id') != razorpay_order_id
+                    or payment.get('amount') != expected_amount
+                    or payment.get('currency') != 'INR'
+                ):
+                    return Response({'error': 'Payment details do not match this order.'}, status=400)
+                if payment.get('status') == 'authorized':
+                    payment = client.payment.capture(
+                        razorpay_payment_id,
+                        expected_amount,
+                        {'currency': 'INR'},
+                    )
+                if payment.get('status') != 'captured':
+                    return Response({'error': 'Payment has not been captured.'}, status=400)
+
+            for product in product_by_id.values():
+                quantity = sum(
+                    item.quantity for item in order_items if item.product_id == product.pk
+                )
+                product.stock -= quantity
+                product.save(update_fields=['stock'])
 
             order.razorpay_payment_id = razorpay_payment_id
             order.razorpay_signature = razorpay_signature
             order.payment_status = 'paid'
             order.status = 'confirmed'
-            order.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'payment_status', 'status'])
-            order.record_status_update('confirmed', 'Razorpay payment verified and order confirmed.')
-
-        cart = Cart.objects.filter(user=request.user).first()
-        if cart:
-            cart.items.all().delete()
+            order.save(update_fields=[
+                'razorpay_payment_id', 'razorpay_signature',
+                'payment_status', 'status', 'updated_at',
+            ])
+            note = (
+                'Demo payment verified. This is a local test order.'
+                if demo_payment
+                else 'Razorpay payment verified and captured.'
+            )
+            order.record_status_update('confirmed', note)
+            _remove_ordered_cart_items(request.user, order_items)
 
         _send_order_confirmation(order)
-        return Response({
-            'message': 'Payment verified. Order confirmed!',
+        response = {
+            'message': 'Demo payment verified. Order confirmed!'
+            if demo_payment else 'Payment verified. Order confirmed!',
             'order_number': order.order_number,
-        })
+        }
+        if demo_payment:
+            response['demo_mode'] = True
+        return Response(response)
     except ValueError as exc:
-        order.payment_status = 'failed'
-        order.status = 'cancelled'
-        order.save(update_fields=['payment_status', 'status'])
-        order.record_status_update('cancelled', f'Order could not be finalized: {exc}')
         return Response({'error': str(exc)}, status=400)
+    except Exception:
+        logger.exception('Razorpay payment verification failed for order %s', order.order_number)
+        return Response({'error': 'Payment could not be verified. Please contact support.'}, status=502)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -708,25 +947,25 @@ def get_product_reviews(request, pk):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def create_review(request, pk):
+    User.objects.select_for_update().get(pk=request.user.pk)
     try:
-        product = Product.objects.get(id=pk)
+        product = Product.objects.select_for_update().get(id=pk)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found'}, status=404)
+
+    input_serializer = ReviewInputSerializer(data=request.data)
+    if not input_serializer.is_valid():
+        return Response(input_serializer.errors, status=400)
 
     if Review.objects.filter(product=product, user=request.user).exists():
         return Response({'error': 'You have already reviewed this product'}, status=400)
 
-    rating = int(request.data.get('rating', 5))
-    if not 1 <= rating <= 5:
-        return Response({'error': 'Rating must be between 1 and 5'}, status=400)
-
     review = Review.objects.create(
         product=product,
         user=request.user,
-        rating=rating,
-        title=request.data.get('title', ''),
-        comment=request.data.get('comment', ''),
+        **input_serializer.validated_data,
     )
     return Response(ReviewSerializer(review).data, status=201)
 
@@ -738,24 +977,31 @@ def create_review(request, pk):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def validate_coupon(request):
-    code = request.data.get('code', '').strip().upper()
-    order_total = request.data.get('order_total', 0)
+    code = request.data.get('code', '')
+    if not isinstance(code, str) or not code.strip() or len(code) > 30:
+        return Response({'valid': False, 'error': 'Enter a valid coupon code.'}, status=400)
+    cart = Cart.objects.filter(user=request.user).order_by('pk').first()
+    cart_items = cart.items.select_related('product').all() if cart else []
+    order_total = sum(
+        item.product.discounted_price * item.quantity
+        for item in cart_items
+    )
 
     try:
-        coupon = Coupon.objects.get(code=code)
+        coupon = Coupon.objects.get(code=code.strip().upper())
     except Coupon.DoesNotExist:
         return Response({'valid': False, 'error': 'Coupon not found'}, status=404)
 
     if not coupon.is_valid:
         return Response({'valid': False, 'error': 'Coupon is expired or inactive'}, status=400)
 
-    if float(order_total) < float(coupon.min_order_amount):
+    if order_total < coupon.min_order_amount:
         return Response({
             'valid': False,
             'error': f'Minimum order ₹{coupon.min_order_amount} required'
         }, status=400)
 
-    discount = coupon.calculate_discount(float(order_total))
+    discount = coupon.calculate_discount(order_total)
     return Response({
         'valid': True,
         'code': coupon.code,
@@ -895,7 +1141,7 @@ def update_profile(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def change_password(request):
-    serializer = ChangePasswordSerializer(data=request.data)
+    serializer = ChangePasswordSerializer(data=request.data, context={'user': request.user})
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
 
@@ -912,9 +1158,10 @@ def change_password(request):
 @permission_classes([AllowAny])
 def forgot_password(request):
     """Send a password-reset link to the user's email."""
-    email = request.data.get('email', '').strip()
-    if not email:
+    email = request.data.get('email', '')
+    if not isinstance(email, str) or not email.strip():
         return Response({'error': 'Email is required'}, status=400)
+    email = email.strip()
 
     try:
         user = User.objects.get(email=email)
@@ -955,14 +1202,13 @@ def reset_password(request):
     new_password = request.data.get('new_password', '')
     new_password2 = request.data.get('new_password2', '')
 
-    if not all([uid_b64, token, new_password, new_password2]):
+    if not all(isinstance(value, str) and value for value in (
+        uid_b64, token, new_password, new_password2
+    )):
         return Response({'error': 'All fields are required'}, status=400)
 
     if new_password != new_password2:
         return Response({'error': 'Passwords do not match'}, status=400)
-
-    if len(new_password) < 6:
-        return Response({'error': 'Password must be at least 6 characters'}, status=400)
 
     try:
         uid = force_str(urlsafe_base64_decode(uid_b64))
@@ -972,6 +1218,11 @@ def reset_password(request):
 
     if not default_token_generator.check_token(user, token):
         return Response({'error': 'Reset link is invalid or has expired'}, status=400)
+
+    try:
+        validate_password(new_password, user=user)
+    except DjangoValidationError as exc:
+        return Response({'new_password': exc.messages}, status=400)
 
     user.set_password(new_password)
     user.save()

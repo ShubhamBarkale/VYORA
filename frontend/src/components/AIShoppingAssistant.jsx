@@ -210,14 +210,20 @@ export default function AIShoppingAssistant() {
                 {loading ? 'Searching...' : 'Ask VYRO'}
                 <Send size={14} />
               </button>
-              <button
-                type="button"
-                onClick={() => askAssistant(null, { action: 'recommend', message: '' })}
-                disabled={loading}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-600 dark:text-slate-200"
-              >
-                <WandSparkles size={14} /> For you
-              </button>
+              {isLoggedIn ? (
+                <button
+                  type="button"
+                  onClick={() => askAssistant(null, { action: 'recommend', message: '' })}
+                  disabled={loading}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-600 dark:text-slate-200"
+                >
+                  <WandSparkles size={14} /> For you
+                </button>
+              ) : (
+                <Link to="/login" className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-600 dark:text-slate-200">
+                  <WandSparkles size={14} /> Sign in for picks
+                </Link>
+              )}
               {selectedProducts.length === 2 && (
                 <button
                   type="button"
@@ -314,9 +320,7 @@ export default function AIShoppingAssistant() {
               <div className="mt-3 rounded-xl border border-slate-200 p-3 text-xs dark:border-slate-700">
                 <p className="font-semibold text-slate-900 dark:text-slate-100">{result.review_summary.product_name}</p>
                 <p className="mt-1 text-slate-600 dark:text-slate-300">
-                  {result.review_summary.review_count
-                    ? `${result.review_summary.average_rating} / 5 from ${result.review_summary.review_count} stored review(s)`
-                    : 'No reviews have been submitted for this product.'}
+                  {result.review_summary.summary}
                 </p>
                 {result.review_summary.review_count > 0 && (
                   <div className="mt-2 flex flex-wrap gap-1.5">

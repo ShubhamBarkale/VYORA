@@ -24,6 +24,7 @@ export default function ProfilePage() {
   const [tab,      setTab]      = useState('profile');
   const [loading,  setLoading]  = useState(false);
   const [orders,   setOrders]   = useState([]);
+  const [orderCount, setOrderCount] = useState(0);
   const [addresses,setAddresses]= useState([]);
   const [addrForm, setAddrForm] = useState({ name:'',phone:'',address_line:'',city:'',state:'',postal_code:'',is_default:false });
   const [editAddr, setEditAddr] = useState(null);
@@ -36,7 +37,13 @@ export default function ProfilePage() {
   }, [user]);
 
   useEffect(() => {
-    authFetch(`${BASE}/api/orders/`).then(r=>r.ok?r.json():[]).then(d=>setOrders(Array.isArray(d)?d:[])).catch(()=>{});
+    authFetch(`${BASE}/api/orders/?page_size=3`)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('Unable to load orders')))
+      .then(data => {
+        setOrders(data.results);
+        setOrderCount(data.count);
+      })
+      .catch(() => {});
     authFetch(`${BASE}/api/addresses/`).then(r=>r.ok?r.json():[]).then(d=>setAddresses(Array.isArray(d)?d:[])).catch(()=>{});
   }, []);
 
@@ -100,7 +107,7 @@ export default function ProfilePage() {
             {/* Quick stats */}
             <div className="grid grid-cols-3 gap-3 w-full sm:w-auto">
               {[
-                { label:'Orders',  value: orders.length, icon:<Package size={16}/>,  to:'/orders'   },
+                { label:'Orders',  value: orderCount, icon:<Package size={16}/>,  to:'/orders'   },
                 { label:'Wishlist',value: wishlistItems.length, icon:<Heart size={16}/>, to:'/wishlist' },
                 { label:'Cart',    value: itemCount, icon:<ShoppingCart size={16}/>, to:'/cart'     },
               ].map(s => (

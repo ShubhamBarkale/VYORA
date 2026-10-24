@@ -2,7 +2,7 @@ import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 
-from django.db.models import Q
+from django.db.models import Avg, Count, Q
 
 from .models import Order, Product, Review
 
@@ -18,11 +18,16 @@ STOP_WORDS = {
 
 BUDGET_PATTERN = re.compile(
     r'(?:under|below|within|budget(?:\s+of)?|up\s+to|upto|max(?:imum)?)'
-    r'\s*(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d{1,2})?)'
-    r'|(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)',
+    r'\s*(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d{1,2})?)\s*(k|thousand)?'
+    r'|(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)\s*(k|thousand)?',
+    re.IGNORECASE,
+)
+SUPPLIED_BUDGET_PATTERN = re.compile(
+    r'^(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d{1,2})?)\s*(k|thousand)?$',
     re.IGNORECASE,
 )
 ORDER_NUMBER_PATTERN = re.compile(r'\b(?:SC)?\d{4,}\b', re.IGNORECASE)
+SC_ORDER_NUMBER_PATTERN = re.compile(r'\bSC\d{4,}\b', re.IGNORECASE)
 SEARCH_SYNONYMS = {
     'earbud': {'earbuds', 'earphone', 'earphones', 'headphone', 'headphones', 'headset'},
     'earbuds': {'earbud', 'earphone', 'earphones', 'headphone', 'headphones', 'headset'},
@@ -45,17 +50,26 @@ def _tokens(value):
 
 def _extract_budget(message, supplied_budget):
     raw_budget = supplied_budget
+    scale = ''
     if raw_budget in (None, ''):
         match = BUDGET_PATTERN.search(message)
-        raw_budget = next((value for value in match.groups() if value), None) if match else None
+        if match:
+            raw_budget = match.group(1) or match.group(3)
+            scale = match.group(2) or match.group(4) or ''
     if raw_budget in (None, ''):
         return None
+    supplied_match = SUPPLIED_BUDGET_PATTERN.fullmatch(str(raw_budget).strip())
+    if supplied_match:
+        raw_budget = supplied_match.group(1)
+        scale = scale or supplied_match.group(2) or ''
     try:
         value = Decimal(str(raw_budget).replace(',', '').strip())
     except (InvalidOperation, ValueError):
         raise ValueError('Enter a valid budget amount.')
     if not value.is_finite() or value <= 0:
         raise ValueError('Budget must be greater than zero.')
+    if scale.lower() in {'k', 'thousand'}:
+        value *= 1000
     return value
 
 
@@ -66,7 +80,12 @@ def _product_text(product):
 def _matching_products(message, user, budget, limit):
     tokens = _tokens(message)
     search_tokens = tokens | set().union(*(SEARCH_SYNONYMS.get(token, set()) for token in tokens))
-    query = Product.objects.filter(is_active=True).select_related('category')
+    query = Product.objects.filter(is_active=True).select_related('category').annotate(
+        _average_rating=Avg('reviews__rating'),
+        _review_count=Count('reviews', distinct=True),
+    )
+    if not tokens and user and user.is_authenticated:
+        query = query.exclude(cartitem__cart__user=user)
     if search_tokens:
         text_filter = Q()
         for token in search_tokens:
@@ -112,7 +131,13 @@ def _matching_products(message, user, budget, limit):
 
 def _find_named_products(message, product_ids, limit=3):
     query_tokens = _tokens(message)
-    products = Product.objects.filter(is_active=True).select_related('category')
+    search_tokens = query_tokens | set().union(
+        *(SEARCH_SYNONYMS.get(token, set()) for token in query_tokens)
+    )
+    products = Product.objects.filter(is_active=True).select_related('category').annotate(
+        _average_rating=Avg('reviews__rating'),
+        _review_count=Count('reviews', distinct=True),
+    )
     if product_ids:
         try:
             ids = [int(product_id) for product_id in product_ids[:limit]]
@@ -126,7 +151,7 @@ def _find_named_products(message, product_ids, limit=3):
     ranked = []
     for product in products[:1000]:
         name_tokens = _tokens(product.name)
-        overlap = len(name_tokens & query_tokens)
+        overlap = len(name_tokens & search_tokens)
         if overlap:
             ranked.append((overlap / max(len(name_tokens), 1), overlap, product))
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -134,33 +159,44 @@ def _find_named_products(message, product_ids, limit=3):
 
 
 def _summarize_reviews(product):
-    reviews = list(
-        Review.objects.filter(product=product).only('rating', 'title', 'comment', 'created_at')
-    )
-    distribution = Counter(review.rating for review in reviews)
+    reviews = Review.objects.filter(product=product)
+    aggregate = reviews.aggregate(average=Avg('rating'), count=Count('id'))
+    distribution = {
+        row['rating']: row['count']
+        for row in reviews.values('rating').annotate(count=Count('id'))
+    }
+    positive_count = sum(distribution.get(rating, 0) for rating in (4, 5))
+    mixed_count = distribution.get(3, 0)
+    critical_count = sum(distribution.get(rating, 0) for rating in (1, 2))
     excerpts = []
-    for review in reviews[:3]:
+    for review in reviews.only('rating', 'title', 'comment', 'created_at')[:3]:
         text = review.comment.strip() or review.title.strip()
         if text:
             excerpts.append({
                 'rating': review.rating,
                 'text': text[:240],
             })
-    average = sum(review.rating for review in reviews) / len(reviews) if reviews else None
+    average = aggregate['average']
+    if aggregate['count']:
+        summary = (
+            f"{positive_count} of {aggregate['count']} reviewers rated this product 4 or 5 stars; "
+            f"{mixed_count} gave it 3 stars and {critical_count} gave it 1 or 2 stars. "
+            f"The catalog average is {round(average, 1)} out of 5."
+        )
+    else:
+        summary = 'No customer reviews have been submitted for this product.'
+
     return {
         'product_id': product.id,
         'product_name': product.name,
-        'review_count': len(reviews),
+        'review_count': aggregate['count'],
         'average_rating': round(average, 1) if average is not None else None,
         'rating_distribution': {
             str(rating): distribution.get(rating, 0) for rating in range(1, 6)
         },
         'excerpts': excerpts,
-        'summary_note': (
-            'Based only on the reviews shown from verified catalog records; no reviews are available.'
-            if not reviews else
-            'Rating counts and excerpts below are taken directly from stored product reviews.'
-        ),
+        'summary': summary,
+        'summary_note': 'Summary is calculated directly from stored product ratings and review excerpts.',
     }
 
 
@@ -214,10 +250,10 @@ def build_assistant_result(
     normalized = message.lower()
     inferred_action = action or ''
     if not inferred_action:
-        if (
-            any(word in normalized for word in ('track', 'tracking', 'where is my order', 'order status'))
-            or ORDER_NUMBER_PATTERN.search(normalized)
-        ):
+        has_order_reference = SC_ORDER_NUMBER_PATTERN.search(normalized) or (
+            'order' in normalized and ORDER_NUMBER_PATTERN.search(normalized)
+        )
+        if any(word in normalized for word in ('track', 'tracking', 'where is my order', 'order status')) or has_order_reference:
             inferred_action = 'order_tracking'
         elif any(word in normalized for word in ('review', 'reviews', 'rating', 'ratings')):
             inferred_action = 'reviews'
