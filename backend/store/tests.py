@@ -1,4 +1,5 @@
 from django.contrib.auth.models import User
+from django.core import mail
 from django.utils import timezone
 from decimal import Decimal
 from datetime import timedelta
@@ -541,3 +542,39 @@ class BackendIntegrityTests(APITestCase):
 
         self.assertIn(response.status_code, (400, 404))
         self.assertNotEqual(response.data.get('valid'), True)
+
+
+class EmailTests(APITestCase):
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+    def test_registration_sends_welcome_email(self):
+        response = self.client.post('/api/register/', {
+            'username': 'email-test-user',
+            'email': 'email-test@example.com',
+            'first_name': 'Email',
+            'password': 'StrongPassword123!',
+            'password2': 'StrongPassword123!',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, 'Welcome to VYORA ✨ | Your Style, Your Story')
+        self.assertEqual(mail.outbox[0].to, ['email-test@example.com'])
+        self.assertIn('Welcome to VYORA', mail.outbox[0].body)
+
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend', FRONTEND_URL='http://localhost:5173')
+    def test_forgot_password_sends_reset_email(self):
+        User.objects.create_user(
+            username='reset-email-user',
+            email='reset-email@example.com',
+            password='StrongPassword123!',
+        )
+
+        response = self.client.post('/api/forgot-password/', {
+            'email': 'reset-email@example.com',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, 'Reset Your VYORA Password')
+        self.assertEqual(mail.outbox[0].to, ['reset-email@example.com'])
+        self.assertIn('/reset-password/', mail.outbox[0].body)

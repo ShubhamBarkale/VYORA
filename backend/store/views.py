@@ -1111,20 +1111,30 @@ def register_view(request):
         # Send welcome email
         try:
             send_mail(
-                subject='Welcome to ShubhamCart! 🎉',
+                subject='Welcome to VYORA ✨ | Your Style, Your Story',
                 message=(
-                    f"Hi {user.first_name or user.username},\n\n"
-                    "Welcome to ShubhamCart! Your account has been created successfully.\n\n"
-                    f"Username: {user.username}\n"
-                    f"Email: {user.email}\n\n"
-                    "Start shopping now: " + settings.FRONTEND_URL
+                    f"Hi {user.first_name or 'there'}! 👋\n\n"
+                    "Welcome to VYORA — where style meets simplicity!\n\n"
+                    "We're delighted to have you join our community. Thank you for creating an account with us!\n\n"
+                    "At VYORA, we believe shopping should be more than just buying products. It should be an experience you enjoy. Explore our collection, discover products you'll love, save your favourites to your wishlist, and enjoy a seamless shopping experience.\n\n"
+                    "Here's what awaits you:\n\n"
+                    "- Discover products that match your style.\n"
+                    "- Save your favourite items to your wishlist.\n"
+                    "- Enjoy a convenient shopping experience.\n"
+                    "- Stay updated on your orders and purchases.\n\n"
+                    "Ready to explore?\n\n"
+                    "Your next favourite find might be just a click away!\n\n"
+                    "Thank you for choosing VYORA. We're excited to be part of your shopping journey.\n\n"
+                    "Warm regards,\n"
+                    "Team VYORA\n"
+                    "Your Style. Your Story. Your VYORA."
                 ),
                 from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[user.email],
-                fail_silently=True,
+                fail_silently=False,
             )
         except Exception:
-            pass
+            logging.exception('Welcome email failed for user %s', user.pk)
         return Response({
             "message": "Account created successfully",
             "user": UserSerializer(user).data
@@ -1208,20 +1218,20 @@ def forgot_password(request):
 
     try:
         send_mail(
-            subject='Reset Your ShubhamCart Password',
+            subject='Reset Your VYORA Password',
             message=(
                 f"Hi {user.first_name or user.username},\n\n"
-                "You requested a password reset for your ShubhamCart account.\n\n"
+                "You requested a password reset for your VYORA account.\n\n"
                 f"Click the link below to reset your password:\n{reset_url}\n\n"
                 "This link is valid for 24 hours. If you didn't request this, ignore this email.\n\n"
-                "— ShubhamCart Team"
+                "- The VYORA Team"
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[email],
             fail_silently=False,
         )
-    except Exception as e:
-        return Response({'error': 'Failed to send email. Please try again.'}, status=500)
+    except Exception:
+        logging.exception('Password reset email failed for user %s', user.pk)
 
     return Response({'message': 'If this email is registered, a reset link has been sent.'})
 
