@@ -65,6 +65,17 @@ const HERO_SLIDES = [
   },
 ];
 
+const HERO_PRODUCT_KEYWORDS = [
+  'dress',
+  'headphones',
+  'sneakers',
+  'backpack',
+  'sunglasses',
+  'earbuds',
+  'fitness band',
+  'speaker',
+];
+
 /* ── Countdown hook ─────────────────────────────────────────────── */
 function useCountdown(targetDate) {
   const calc = useCallback(() => {
@@ -237,11 +248,15 @@ export default function HomePage() {
       setNewest((newArr.results  || []).slice(0, 10));
       setTrending((feat.results  || []).slice(0, 10));
       setDiscounted((feat.results|| []).filter(p => p.discount_percent > 0).slice(0, 8));
+      const catalog = [...(feat.results || []), ...(newArr.results || [])]
+        .filter((product, index, products) =>
+          product.image_url && products.findIndex(item => item.id === product.id) === index
+        );
+      const curated = HERO_PRODUCT_KEYWORDS
+        .map(keyword => catalog.find(product => product.name.toLowerCase().includes(keyword)))
+        .filter(Boolean);
       setHeroProducts(
-        [...(feat.results || []), ...(newArr.results || [])]
-          .filter((product, index, products) =>
-            product.image_url && products.findIndex(item => item.id === product.id) === index
-          )
+        [...new Map([...curated, ...catalog].map(product => [product.id, product])).values()]
           .slice(0, 8)
       );
     }).catch(() => {}).finally(() => { if (!cancelled) setLoading(false); });
@@ -272,7 +287,7 @@ export default function HomePage() {
       <section className="home-hero relative hero-gradient overflow-hidden">
         <div className="home-hero-backdrop" aria-hidden="true">
           <img
-            src="https://images.unsplash.com/photo-1524504388940-b1c1722653e1?auto=format&fit=crop&w=1600&q=85"
+            src="/images/home-hero.jpg"
             alt=""
           />
         </div>
@@ -315,7 +330,13 @@ export default function HomePage() {
                 className={`home-hero-product home-hero-product-${index + 1}`}
                 aria-label={`View ${product.name}`}
               >
-                <img src={product.image_url} alt="" />
+                <img
+                  src={product.image_url}
+                  alt=""
+                  onError={event => {
+                    event.currentTarget.closest('a').style.display = 'none';
+                  }}
+                />
                 <span>{product.name}</span>
               </Link>
             )) : (
@@ -351,20 +372,36 @@ export default function HomePage() {
         <section>
           <SectionHeader title="Shop by Category" subtitle="Browse our wide range of categories" />
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
-            {CATEGORIES.map(cat => (
-              <Link key={cat.slug} to={`/shop?category=${cat.slug}`}
-                className="home-category-card vyora-card cursor-pointer group">
-                <div className="home-category-image">
-                  {imageForCategory(cat) ? (
-                    <img src={imageForCategory(cat)} alt="" loading="lazy" />
-                  ) : (
-                    <span className={`bg-gradient-to-br ${cat.color}`}>{cat.icon}</span>
-                  )}
-                </div>
-                <span className="home-category-name">{cat.name}</span>
-                <ArrowRight size={14} className="home-category-arrow" aria-hidden="true" />
-              </Link>
-            ))}
+            {CATEGORIES.map(cat => {
+              const imageUrl = imageForCategory(cat);
+              return (
+                <Link key={cat.slug} to={`/shop?category=${cat.slug}`}
+                  className="home-category-card vyora-card cursor-pointer group">
+                  <div className="home-category-image">
+                    {imageUrl ? (
+                      <>
+                        <img
+                          src={imageUrl}
+                          alt=""
+                          loading="lazy"
+                          onError={event => {
+                            event.currentTarget.style.display = 'none';
+                            event.currentTarget.nextElementSibling.style.display = 'grid';
+                          }}
+                        />
+                        <span className={`bg-gradient-to-br ${cat.color}`} style={{ display: 'none' }}>
+                          {cat.icon}
+                        </span>
+                      </>
+                    ) : (
+                      <span className={`bg-gradient-to-br ${cat.color}`}>{cat.icon}</span>
+                    )}
+                  </div>
+                  <span className="home-category-name">{cat.name}</span>
+                  <ArrowRight size={14} className="home-category-arrow" aria-hidden="true" />
+                </Link>
+              );
+            })}
           </div>
         </section>
 
